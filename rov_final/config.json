@@ -1,0 +1,51 @@
+{
+  "_note": "Tune ALL HSV values in pool under competition lighting. Run tools/tune_hsv.py",
+
+  "orange_flare": {
+    "h_low": 5,   "s_low": 120, "v_low": 100,
+    "h_high": 20, "s_high": 255, "v_high": 255,
+    "min_area": 800
+  },
+  "gate": {
+    "canny_low": 50, "canny_high": 150,
+    "hough_threshold": 80,
+    "hough_min_line_length": 60,
+    "hough_max_line_gap": 20,
+    "vertical_angle_tolerance_deg": 20,
+    "min_pipe_separation_px": 60
+  },
+  "green_mat": {
+    "h_low": 40,  "s_low": 60,  "v_low": 40,
+    "h_high": 90, "s_high": 255, "v_high": 255,
+    "min_area": 5000
+  },
+  "red_drum": {
+    "ranges": [
+      {"h_low": 0,   "s_low": 100, "v_low": 60,  "h_high": 10,  "s_high": 255, "v_high": 255},
+      {"h_low": 160, "s_low": 100, "v_low": 60,  "h_high": 180, "s_high": 255, "v_high": 255}
+    ],
+    "min_area": 400
+  },
+  "blue_drum": {
+    "h_low": 95,  "s_low": 80,  "v_low": 50,
+    "h_high": 130, "s_high": 255, "v_high": 255,
+    "min_area": 400,
+    "drop_min_area": 4000
+  },
+  "alignment": {
+    "frame_width": 640,
+    "frame_height": 480,
+    "center_tolerance_px": 20,
+    "yaw_kp": 0.5,
+    "yaw_ki": 0.0,
+    "yaw_kd": 0.05,
+    "yaw_max_cmd": 0.6
+  },
+  "navigation": {
+    "surge_speed": 0.35,
+    "approach_speed": 0.20,
+    "uturn_yaw_speed": 0.4,
+    "surge_mps": 0.4,
+    "yaw_dps": 55.0
+  }
+}
