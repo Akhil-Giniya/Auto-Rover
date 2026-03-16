@@ -1,0 +1,1682 @@
+#ifndef ARDUINO_USB_CDC_ON_BOOT
+#define ARDUINO_USB_CDC_ON_BOOT 1
+#endif
+
+struct AxisEkf; // forward declaration for Arduino auto-generated prototypes
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <IBusBM.h>
+#include <Adafruit_LSM9DS1.h>
+#include <Adafruit_Sensor.h>
+#include <MS5837.h>
+#include <Preferences.h>
+#include <Adafruit_NeoPixel.h>
+#include <esp_task_wdt.h>
+#include <esp_idf_version.h>
+#include "esp32-hal-ledc.h"
+
+constexpr bool I2C_SCAN_ONLY = false; // true = print only I2C addresses
+constexpr bool MAG_ONLY = false; // true = print only magnetometer line
+constexpr bool SERIAL_LOG_ENABLE = true; // false = disable serial debug logs for hardware tests
+#define DBG_PRINTLN(msg) do { if (SERIAL_LOG_ENABLE && !I2C_SCAN_ONLY && !MAG_ONLY) Serial.println(msg); } while (0)
+#define DBG_PRINTF(...) do { if (SERIAL_LOG_ENABLE && !I2C_SCAN_ONLY && !MAG_ONLY) Serial.printf(__VA_ARGS__); } while (0)
+
+// ---------- Pin map ----------
+constexpr uint8_t LSM9DS1_XG_ADDR = 0x6B; // accel/gyro
+constexpr uint8_t LSM9DS1_M_ADDR  = 0x1E; // magnetometer
+
+constexpr int PIN_I2C_SDA  = 8;
+constexpr int PIN_I2C_SCL  = 9;
+
+constexpr int PIN_ESC1 = 7;   // Front-Left
+constexpr int PIN_ESC2 = 5;   // Front-Right
+constexpr int PIN_ESC3 = 6;   // Rear-Left
+constexpr int PIN_ESC4 = 4;   // Rear-Right
+
+constexpr int PIN_SERVO_FRONT = 14;
+constexpr int PIN_SERVO_REAR  = 15;
+constexpr int PIN_SERVO_FRONT_MIRROR = 35; // servo3 (inverse of front)
+constexpr int PIN_SERVO_REAR_MIRROR  = 36; // servo4 (inverse of rear)
+
+constexpr int PIN_IBUS_RX = 16;
+constexpr int PIN_IBUS_TX = 17;
+constexpr int PIN_CAL_BUTTON = 18; // active LOW, wire button to GND
+constexpr int PIN_DEPTH_HOLD_ENABLE = 10; // HIGH = enable depth hold at current depth
+constexpr int PIN_RGB = 48;
+constexpr int NUM_PIXELS = 1;
+constexpr bool IBUS_DEBUG_ONLY = false; // set true for iBus/sensor debug only
+
+// ---------- RC mapping ----------
+static IBusBM ibus;
+volatile uint16_t rcRaw[14];
+uint32_t lastRcMicros = 0;
+constexpr uint32_t RC_LOST_US = 500000;
+constexpr uint16_t RC_VALID_MIN_US = 850;
+constexpr uint16_t RC_VALID_MAX_US = 2150;
+constexpr uint8_t RC_GOOD_FRAMES_TO_CONNECT = 2;
+constexpr float RC_CMD_DEADBAND = 0.05f; // normalized stick deadband around center
+// RC channel map (0-based iBus indices)
+// Adjust here if your transmitter uses a different channel order.
+constexpr int RC_CH_ROLL_SWAY   = 0; // CH1: roll or sway (manual, via CH8 switch)
+constexpr int RC_CH_PITCH_SURGE = 1; // CH2: pitch or surge (manual, via CH9 switch)
+constexpr int RC_CH_HEAVE       = 2; // CH3 (throttle/heave)
+constexpr int RC_CH_YAW         = 3; // CH4 (rudder)
+constexpr int RC_CH_SERVO_FRONT = 4; // CH5
+constexpr int RC_CH_MODE        = 5; // CH6 (3-position mode)
+constexpr int RC_CH_SERVO_REAR  = 6; // CH7
+constexpr int RC_CH_SWAY_SEL    = 7; // CH8: 1000=roll, 2000=sway
+constexpr int RC_CH_PITCH_SEL   = 8; // CH9: 1000=surge, 2000=pitch
+constexpr int RC_CH_ARM         = 9; // CH10 arm/disarm
+
+inline float rcNorm(int ch, float min=1000, float max=2000) {
+  float v = constrain(rcRaw[ch], 1000, 2000);
+  return (v - min) / (max - min) * 2.f - 1.f; // -1..1
+}
+
+inline float applyDeadband(float v, float deadband = RC_CMD_DEADBAND) {
+  v = constrain(v, -1.0f, 1.0f);
+  deadband = constrain(deadband, 0.0f, 0.95f);
+  float a = fabsf(v);
+  if (a <= deadband) return 0.0f;
+  float scaled = (a - deadband) / max(1e-4f, 1.0f - deadband);
+  return (v >= 0.0f) ? scaled : -scaled;
+}
+
+// ---------- Sensors ----------
+Adafruit_LSM9DS1 imuLSM = Adafruit_LSM9DS1(&Wire);
+MS5837 depthSensor;
+Preferences prefs;
+
+// ---------- ESC / Servo ----------
+Adafruit_NeoPixel pixel(NUM_PIXELS, PIN_RGB, NEO_GRB + NEO_KHZ800);
+
+// ---------- PID ----------
+struct PID {
+  float kp, ki, kd;
+  float outMin, outMax;
+  float iTerm = 0, prev = 0;
+  float update(float setpoint, float meas, float dt) {
+    float err = setpoint - meas;
+    float d = (err - prev) / max(dt, 1e-4f);
+    prev = err;
+    float p = err * kp;
+    float iNew = iTerm + err * ki * dt;
+    float out = p + iNew + d * kd;
+    if (out > outMax || out < outMin) {
+      out = constrain(out, outMin, outMax);
+      // Anti-windup: hold integrator when saturated.
+    } else {
+      iTerm = constrain(iNew, outMin, outMax);
+    }
+    return out;
+  }
+  void reset() { iTerm = prev = 0; }
+};
+
+struct AxisEkf {
+  float angle = 0.0f; // deg
+  float bias = 0.0f;  // deg/s
+  float P00 = 1.0f, P01 = 0.0f, P10 = 0.0f, P11 = 1.0f;
+};
+
+PID pidRoll  { 2.0f, 0.5f, 0.05f, -1, 1 };
+PID pidPitch { 2.0f, 0.5f, 0.05f, -1, 1 };
+PID pidYaw   { 1.5f, 0.3f, 0.02f, -1, 1 };
+PID pidDepth { 2.5f, 0.6f, 0.1f,  -1, 1 };
+
+// ---------- State ----------
+float rollDeg=0, pitchDeg=0, yawDeg=0;
+float depthM = 0, depthTarget = 0;
+float depthPressureMbar = 0;
+float servoFrontDeg=90, servoRearDeg=90;
+float servo3Deg=90, servo4Deg=90;
+float imuAccX = 0, imuAccY = 0, imuAccZ = 0;
+float imuGyrX = 0, imuGyrY = 0, imuGyrZ = 0;
+float imuRollRawFilt = 0, imuPitchRawFilt = 0, imuYawRawFilt = 0;
+AxisEkf ekfRollState, ekfPitchState, ekfYawState;
+float imuTempC = 0;
+float magX = 0, magY = 0, magZ = 0;
+float magMinX = 1e6f, magMaxX = -1e6f;
+float magMinY = 1e6f, magMaxY = -1e6f;
+float magMinZ = 1e6f, magMaxZ = -1e6f;
+float headingDeg = 0;
+float rollLevelOffsetDeg = 0;
+float pitchLevelOffsetDeg = 0;
+float yawLevelOffsetDeg = 0;
+int escPwmUs[4] = {1500, 1500, 1500, 1500};
+bool imuOk = false;
+bool depthOk = false;
+bool imuFilterPrimed = false;
+bool magOk = false;
+bool magPresent = false;
+bool useExternalMag = false;
+bool prefsReady = false;
+bool armed = false;
+bool lowBattery = false;
+bool depthFilterPrimed = false;
+bool powerFilterPrimed = false;
+bool depthHoldEnabledState = false;
+float batteryVolts = 0.0f;
+float currentAmps = 0.0f;
+bool pwmOutputsReady = false;
+bool rcLostState = true;
+bool rcLinkConnected = false;
+uint8_t rcGoodFrameStreak = 0;
+bool ch8SwayMode = false;
+bool ch9PitchMode = false;
+float cmdRollIn = 0, cmdPitchIn = 0, cmdHeaveIn = 0, cmdYawIn = 0;
+float cmdSurgeOut = 0, cmdSwayOut = 0, cmdHeaveOut = 0, cmdYawOut = 0;
+float thrusterOutCmd[4] = {0, 0, 0, 0};
+uint32_t lastRgbUpdate = 0;
+enum Mode { MANUAL, DEPTH_STAB, PITCH_STAB };
+Mode mode = MANUAL;
+
+// Thruster mix for layout:
+// Front: T1 (FL, CW) ---- T2 (FR, CCW)
+// Back:  T3 (BL, CCW) --- T4 (BR, CW)
+// Final requested direction table for +axis command (f=> >1500us, r=> <1500us):
+// heave: (f,f,f,f), surge: (r,r,f,f), sway: (r,f,r,f),
+// roll: (r,f,r,f), pitch: (f,f,r,r), yaw: (r,f,f,r)
+constexpr float MIX_SURGE[4] = {-1.f, -1.f, +1.f, +1.f};
+constexpr float MIX_SWAY[4]  = {-1.f, +1.f, -1.f, +1.f};
+constexpr float MIX_YAW[4]   = {-1.f, +1.f, +1.f, -1.f};
+constexpr float MIX_ROLL[4]  = {-1.f, +1.f, -1.f, +1.f};
+constexpr float MIX_PITCH[4] = {+1.f, +1.f, -1.f, -1.f};
+// Hardware-only thruster direction (serial thrCmd stays unchanged):
+// +1.0f = normal, -1.0f = reverse that thruster output.
+// Order: T1, T2, T3, T4
+constexpr float THRUSTER_HW_DIR[4] = {+1.0f, +1.0f, +1.0f, -1.0f};
+constexpr float SERVO_DEG_FORWARD = 45.f;   // fully horizontal
+constexpr float SERVO_DEG_UP      = 135.f;  // fully vertical
+constexpr int SERVO_US_FORWARD = 1000;
+constexpr int SERVO_US_UP      = 2000;
+constexpr bool SERVO_USE_RC_CH5_CH7_IN_ALL_MODES = false; // manual-mode-only servo positioning
+constexpr bool SERVO_RC_DIRECT_TRACKING = true;
+constexpr int ESC_US_REV  = 1000;
+constexpr int ESC_US_STOP = 1500;
+constexpr int ESC_US_FWD  = 2000;
+constexpr int ESC_CENTER_DEADZONE_US = 50; // clamp to 1500 in [1470..1530]
+constexpr int ESC_CENTER_HYST_US = 20; // extra neutral hold to avoid center wiggle
+constexpr int ESC_MIN_START_US = 20; // minimum step away from center when starting
+// Direction-specific response tuning to balance forward/reverse feel.
+constexpr float ESC_FWD_CMD_EXPO = 1.35f;   // >1 softens around center
+constexpr float ESC_REV_CMD_EXPO = 1.05f;   // near-linear reverse
+constexpr float ESC_FWD_CMD_GAIN = 0.92f;   // reduce forward aggressiveness
+constexpr float ESC_REV_CMD_GAIN = 1.00f;   // full reverse range
+constexpr float ESC_SLEW_US_PER_SEC_FWD = 26000.0f;
+constexpr float ESC_SLEW_US_PER_SEC_REV = 26000.0f;
+constexpr float ESC_SLEW_US_PER_SEC_TO_STOP_FROM_FWD = 30000.0f;
+constexpr float ESC_SLEW_US_PER_SEC_TO_STOP_FROM_REV = 15000.0f;
+// DS3235 datasheet (no-load): 0.11 s / 60 deg @ 7.4V ~= 545 deg/s.
+constexpr float SERVO_SLEW_DEG_PER_SEC = 545.0f;
+constexpr uint32_t ESC_PWM_FREQ_HZ = 400;   // faster ESC update
+constexpr uint32_t SERVO_PWM_FREQ_HZ = 50;  // keep servo standard
+constexpr uint8_t PWM_OUTPUT_RES_BITS = 14;
+constexpr int PWM_MIN_US = 500;
+constexpr int PWM_MAX_US = 2500;
+constexpr float MANUAL_ROLL_GAIN = 0.6f;   // CH1 roll authority in MANUAL mode
+constexpr float MANUAL_PITCH_GAIN = 0.6f;  // CH2 pitch authority when CH9=2000
+constexpr float IMU_ACC_FILTER_ALPHA = 0.25f;
+constexpr float IMU_GYR_FILTER_ALPHA = 0.25f;
+constexpr float IMU_MAG_FILTER_ALPHA = 0.25f;
+constexpr float IMU_TEMP_FILTER_ALPHA = 0.20f;
+constexpr float DEPTH_FILTER_ALPHA = 0.20f;
+constexpr float BATT_FILTER_ALPHA = 0.12f;
+constexpr float CURR_FILTER_ALPHA = 0.18f;
+constexpr float THRUSTER_CMD_FILTER_ALPHA = 0.10f;
+constexpr float THRUSTER_FILTER_TO_STOP_FROM_FWD_ALPHA = 0.45f;
+constexpr float THRUSTER_FILTER_TO_STOP_FROM_REV_ALPHA = 0.25f;
+constexpr float THRUSTER_CENTER_CMD_EPS = 0.04f; // treat near-zero as center command
+constexpr float SERVO_FRONT_FILTER_ALPHA = 0.60f;
+constexpr float SERVO_REAR_FILTER_ALPHA = 0.60f;
+constexpr uint32_t CAL_BTN_DEBOUNCE_MS = 40;
+constexpr const char *CAL_NS = "rov_cal";
+constexpr const char *CAL_KEY_VALID = "valid";
+constexpr const char *CAL_KEY_ROLL = "roll";
+constexpr const char *CAL_KEY_PITCH = "pitch";
+constexpr const char *CAL_KEY_YAW = "yaw";
+constexpr float STAB_SMALL_CORR_SCALE = 0.30f;
+constexpr float STAB_HIGH_CORR_SCALE  = 0.85f;
+constexpr float STAB_MAX_CORR         = 0.80f;
+constexpr float STAB_ROLL_DB_DEG      = 1.5f;
+constexpr float STAB_ROLL_HIGH_DEG    = 12.0f;
+constexpr float STAB_PITCH_DB_DEG     = 1.5f;
+constexpr float STAB_PITCH_HIGH_DEG   = 12.0f;
+constexpr float STAB_DEPTH_DB_M       = 0.03f;
+constexpr float STAB_DEPTH_HIGH_M     = 0.30f;
+constexpr float STAB_YAWRATE_DB_DPS   = 3.0f;
+constexpr float STAB_YAWRATE_HIGH_DPS = 35.0f;
+constexpr float STAB_DEPTH_AXIS_START = 110.0f; // begin depth correction
+constexpr float STAB_DEPTH_AXIS_FULL  = 130.0f; // full depth correction
+constexpr float STAB_YAW_AXIS_FULL    = 50.0f;  // full yaw correction
+constexpr float STAB_YAW_AXIS_OFF     = 80.0f;  // yaw correction off by here
+constexpr bool HAVE_BATT_SENSE        = true;
+constexpr int PIN_BATT_ADC            = 1; // 25V module output -> GPIO1 (ADC)
+constexpr float BATT_LOW_VOLTS        = 10.5f;
+constexpr bool HAVE_CURR_SENSE        = true;
+constexpr int PIN_CURR_ADC            = 2; // WCS1700 output -> GPIO2 (ADC)
+constexpr float ADC_REF_VOLT          = 3.3f;
+constexpr int ADC_MAX_COUNTS          = 4095;
+constexpr float VOLTAGE_DIV_RATIO     = 5.0f;  // set to your module divider ratio
+constexpr float ACS_ZERO_VOLT         = 1.65f; // ~Vcc/2 for WCS1700 module
+constexpr float ACS_SENS_V_PER_A      = 0.066f; // V/A for common WCS1700 modules
+constexpr float FAILSAFE_DEPTH_TARGET = -0.2f;  // meters (negative = up in your convention)
+constexpr float FAILSAFE_HEAVE_CMD    = -0.2f;  // used if no depth sensor
+constexpr uint32_t WDT_TIMEOUT_MS     = 2000;
+constexpr float IMU_ACC_X_SIGN = 1.0f;
+constexpr float IMU_ACC_Y_SIGN = 1.0f;
+constexpr float IMU_ACC_Z_SIGN = 1.0f;
+constexpr float IMU_GYR_X_SIGN = 1.0f;
+constexpr float IMU_GYR_Y_SIGN = 1.0f;
+constexpr float IMU_GYR_Z_SIGN = 1.0f;
+constexpr float IMU_MAG_X_SIGN = 1.0f;
+constexpr float IMU_MAG_Y_SIGN = 1.0f;
+constexpr float IMU_MAG_Z_SIGN = 1.0f;
+constexpr float MAG_DECLINATION_DEG = 0.0f;
+constexpr float IMU_COMP_ALPHA = 0.98f; // complementary filter (gyro weight)
+constexpr float IMU_EKF_Q_ANGLE = 0.03f;
+constexpr float IMU_EKF_Q_BIAS = 0.003f;
+constexpr float IMU_EKF_R_ROLL_PITCH = 8.0f;
+constexpr float IMU_EKF_R_YAW = 6.0f;
+constexpr float IMU_EKF_ACC_G_TRUST = 0.10f; // trust accel update only very near 1 g
+constexpr float IMU_EKF_ACC_MAX_GYRO_DPS = 80.0f; // reject accel correction during fast rotations
+constexpr float IMU_EKF_YAW_INNOV_MAX_DEG = 35.0f; // reject sudden mag jumps
+constexpr bool MAG_AUTO_CAL_ENABLE = true;
+constexpr float MAG_AUTO_CAL_MIN_SPAN_UT = 8.0f;
+constexpr float MAG_FIELD_MIN_UT = 8.0f;
+constexpr float MAG_FIELD_MAX_UT = 120.0f;
+constexpr uint8_t HMC5883L_ADDR = 0x1E;
+constexpr uint8_t QMC5883L_ADDR = 0x0D;
+constexpr uint8_t HMC_REG_CONFIG_A = 0x00;
+constexpr uint8_t HMC_REG_CONFIG_B = 0x01;
+constexpr uint8_t HMC_REG_MODE = 0x02;
+constexpr uint8_t HMC_REG_DATA = 0x03;
+constexpr uint8_t QMC_REG_CTRL1 = 0x09;
+constexpr uint8_t QMC_REG_CTRL2 = 0x0A;
+constexpr uint8_t QMC_REG_DATA = 0x00;
+
+// ---------- Utility ----------
+void calibrationButtonTask(float rawRollDeg, float rawPitchDeg, float rawYawDeg);
+void updateStatusLed(bool isArmed, Mode curMode, bool rcLost, bool imuOkFlag, bool lowBatt);
+void updateImuAndDepth(float dt);
+void initPreferences();
+void initWatchdog();
+void feedWatchdog();
+void subscribeCurrentTaskToWatchdog(const char *taskName);
+void updatePowerReadings();
+float readCurrentAmps();
+void printIbusChannels();
+void printSensors();
+void scanI2CBus();
+bool initExternalMag();
+bool readExternalMag(float &mx, float &my, float &mz);
+bool setupPwmOutputPin(int pin, uint32_t freqHz, const char *tag);
+void pwmWriteUs(int pin, int pulseUs, uint32_t freqHz);
+
+float mapf(float x, float inMin, float inMax, float outMin, float outMax) {
+  return (x - inMin)*(outMax - outMin)/(inMax - inMin) + outMin;
+}
+
+inline float lowPass(float prev, float input, float alpha) {
+  return prev + alpha * (input - prev);
+}
+
+inline float wrapDeg180(float deg) {
+  while (deg > 180.0f) deg -= 360.0f;
+  while (deg <= -180.0f) deg += 360.0f;
+  return deg;
+}
+
+inline float wrapDeg360(float deg) {
+  while (deg >= 360.0f) deg -= 360.0f;
+  while (deg < 0.0f) deg += 360.0f;
+  return deg;
+}
+
+inline void ekfReset(AxisEkf &ekf, float angleDeg) {
+  ekf.angle = angleDeg;
+  ekf.bias = 0.0f;
+  ekf.P00 = 1.0f;
+  ekf.P01 = 0.0f;
+  ekf.P10 = 0.0f;
+  ekf.P11 = 1.0f;
+}
+
+inline float ekfStepAxis(AxisEkf &ekf, float gyroRateDegS, float dt,
+                         bool hasMeasurement, float measurementDeg,
+                         float qAngle, float qBias, float rMeas,
+                         bool circularAngle) {
+  // Predict
+  float rate = gyroRateDegS - ekf.bias;
+  ekf.angle += dt * rate;
+  if (circularAngle) ekf.angle = wrapDeg180(ekf.angle);
+
+  float P00 = ekf.P00;
+  float P01 = ekf.P01;
+  float P10 = ekf.P10;
+  float P11 = ekf.P11;
+  ekf.P00 = P00 + dt * (dt * P11 - P01 - P10 + qAngle);
+  ekf.P01 = P01 - dt * P11;
+  ekf.P10 = P10 - dt * P11;
+  ekf.P11 = P11 + qBias * dt;
+
+  P00 = ekf.P00;
+  P01 = ekf.P01;
+  P10 = ekf.P10;
+  P11 = ekf.P11;
+
+  if (!hasMeasurement) {
+    return ekf.angle;
+  }
+
+  // Update
+  float innovation = circularAngle ? wrapDeg180(measurementDeg - ekf.angle) : (measurementDeg - ekf.angle);
+  float S = P00 + rMeas;
+  float K0 = P00 / max(1e-6f, S);
+  float K1 = P10 / max(1e-6f, S);
+
+  ekf.angle += K0 * innovation;
+  ekf.bias  += K1 * innovation;
+  if (circularAngle) ekf.angle = wrapDeg180(ekf.angle);
+
+  ekf.P00 = P00 - K0 * P00;
+  ekf.P01 = P01 - K0 * P01;
+  ekf.P10 = P10 - K1 * P00;
+  ekf.P11 = P11 - K1 * P01;
+
+  return ekf.angle;
+}
+
+inline float blendHeadingDeg(float currentDeg, float measDeg, float alpha) {
+  float cur360 = wrapDeg360(currentDeg);
+  float meas360 = wrapDeg360(measDeg);
+  float delta = wrapDeg180(meas360 - cur360);
+  return wrapDeg360(cur360 + (1.0f - alpha) * delta);
+}
+
+inline float slewLimit(float current, float target, float maxDelta) {
+  if (target > current + maxDelta) return current + maxDelta;
+  if (target < current - maxDelta) return current - maxDelta;
+  return target;
+}
+
+inline float ramp01(float x, float x0, float x1) {
+  return constrain((x - x0) / max(1e-4f, x1 - x0), 0.0f, 1.0f);
+}
+
+inline float stabilizerCorrection(float pidOut, float errAbs, float deadband, float highBand) {
+  if (errAbs <= deadband) return 0.0f; // ignore very small errors
+  float w = ramp01(errAbs, deadband, highBand);
+  float scale = STAB_SMALL_CORR_SCALE + w * (STAB_HIGH_CORR_SCALE - STAB_SMALL_CORR_SCALE);
+  return constrain(pidOut * scale, -STAB_MAX_CORR, STAB_MAX_CORR);
+}
+
+inline float depthAxisFactor(float servoAvgDeg) {
+  // Depth correction is strongest near vertical (~135 deg).
+  return ramp01(servoAvgDeg, STAB_DEPTH_AXIS_START, STAB_DEPTH_AXIS_FULL);
+}
+
+inline float yawAxisFactor(float servoAvgDeg) {
+  // Yaw correction is strongest near horizontal (~45 deg).
+  return constrain((STAB_YAW_AXIS_OFF - servoAvgDeg) / max(1e-4f, STAB_YAW_AXIS_OFF - STAB_YAW_AXIS_FULL), 0.0f, 1.0f);
+}
+
+inline float dot4(const float a[4], const float b[4]) {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+}
+
+void mixAxesToThrusters(float surge, float sway, float yaw, float heave, float roll, float pitch,
+                        int curMode, float curServoFrontDeg, float curServoRearDeg,
+                        float outThr[4]) {
+  float H1 = MIX_SURGE[0] * surge + MIX_SWAY[0] * sway + MIX_YAW[0] * yaw;
+  float H2 = MIX_SURGE[1] * surge + MIX_SWAY[1] * sway + MIX_YAW[1] * yaw;
+  float H3 = MIX_SURGE[2] * surge + MIX_SWAY[2] * sway + MIX_YAW[2] * yaw;
+  float H4 = MIX_SURGE[3] * surge + MIX_SWAY[3] * sway + MIX_YAW[3] * yaw;
+
+  float V1, V2, V3, V4;
+  if (curMode == PITCH_STAB) {
+    float frontVert = depthAxisFactor(curServoFrontDeg);
+    float rearVert = depthAxisFactor(curServoRearDeg);
+    float rearHoriz = yawAxisFactor(curServoRearDeg);
+    H3 *= rearHoriz;
+    H4 *= rearHoriz;
+
+    float heaveFront = heave * frontVert;
+    float rollFront = roll * frontVert;
+    float heaveRear = heave * rearVert;
+    float rollRear = roll * rearVert;
+    float pitchFront = pitch;
+
+    V1 = heaveFront + MIX_ROLL[0] * rollFront + MIX_PITCH[0] * pitchFront;
+    V2 = heaveFront + MIX_ROLL[1] * rollFront + MIX_PITCH[1] * pitchFront;
+    V3 = heaveRear  + MIX_ROLL[2] * rollRear;
+    V4 = heaveRear  + MIX_ROLL[3] * rollRear;
+  } else {
+    V1 = heave + MIX_ROLL[0] * roll + MIX_PITCH[0] * pitch;
+    V2 = heave + MIX_ROLL[1] * roll + MIX_PITCH[1] * pitch;
+    V3 = heave + MIX_ROLL[2] * roll + MIX_PITCH[2] * pitch;
+    V4 = heave + MIX_ROLL[3] * roll + MIX_PITCH[3] * pitch;
+  }
+
+  if (curMode == MANUAL) {
+    outThr[0] = H1 + V1;
+    outThr[1] = H2 + V2;
+    outThr[2] = H3 + V3;
+    outThr[3] = H4 + V4;
+    return;
+  }
+
+  float tiltFront = (curServoFrontDeg - SERVO_DEG_FORWARD) * DEG_TO_RAD;
+  float tiltRear  = (curServoRearDeg  - SERVO_DEG_FORWARD) * DEG_TO_RAD;
+  float ctFront = cosf(tiltFront);
+  float stFront = sinf(tiltFront);
+  float ctRear  = cosf(tiltRear);
+  float stRear  = sinf(tiltRear);
+
+  outThr[0] = H1 * ctFront + V1 * stFront;
+  outThr[1] = H2 * ctFront + V2 * stFront;
+  outThr[2] = H3 * ctRear  + V3 * stRear;
+  outThr[3] = H4 * ctRear  + V4 * stRear;
+}
+
+void computeDofWeightsPct(const float thr[4], int curMode, float curServoFrontDeg, float curServoRearDeg, float outPct[6]) {
+  // Order: surge, sway, heave, roll, pitch, yaw
+  float basis[6][4];
+  mixAxesToThrusters(1, 0, 0, 0, 0, 0, curMode, curServoFrontDeg, curServoRearDeg, basis[0]); // surge
+  mixAxesToThrusters(0, 1, 0, 0, 0, 0, curMode, curServoFrontDeg, curServoRearDeg, basis[1]); // sway
+  mixAxesToThrusters(0, 0, 0, 1, 0, 0, curMode, curServoFrontDeg, curServoRearDeg, basis[2]); // heave
+  mixAxesToThrusters(0, 0, 0, 0, 1, 0, curMode, curServoFrontDeg, curServoRearDeg, basis[3]); // roll
+  mixAxesToThrusters(0, 0, 0, 0, 0, 1, curMode, curServoFrontDeg, curServoRearDeg, basis[4]); // pitch
+  mixAxesToThrusters(0, 0, 1, 0, 0, 0, curMode, curServoFrontDeg, curServoRearDeg, basis[5]); // yaw
+
+  float mag[6] = {0, 0, 0, 0, 0, 0};
+  float magSum = 0.0f;
+  for (int i = 0; i < 6; i++) {
+    float norm2 = dot4(basis[i], basis[i]);
+    if (norm2 <= 1e-6f) {
+      mag[i] = 0.0f;
+      continue;
+    }
+    // Magnitude of thruster vector component along this DOF basis.
+    mag[i] = fabsf(dot4(thr, basis[i])) / sqrtf(norm2);
+    magSum += mag[i];
+  }
+
+  if (magSum <= 1e-6f) {
+    for (int i = 0; i < 6; i++) outPct[i] = 0.0f;
+    return;
+  }
+
+  for (int i = 0; i < 6; i++) {
+    outPct[i] = 100.0f * mag[i] / magSum;
+  }
+}
+
+inline bool rcFrameLooksValid(const uint16_t channels[14]) {
+  // IBusBM already validates packet checksum. Some radios leave channels as 0
+  // when switches/aux are not configured, so accept frames if enough channels
+  // are in plausible RC PWM range.
+  int plausibleCount = 0;
+  for (int i = 0; i < 14; i++) {
+    uint16_t v = channels[i];
+    if (v >= RC_VALID_MIN_US && v <= RC_VALID_MAX_US) plausibleCount++;
+  }
+  return plausibleCount >= 4;
+}
+
+inline bool updateRcLinkState(bool gotValidFrame) {
+  uint32_t nowMicros = micros();
+  if (gotValidFrame && rcGoodFrameStreak < 255) {
+    rcGoodFrameStreak++;
+  }
+
+  if (rcLinkConnected) {
+    if ((nowMicros - lastRcMicros) > RC_LOST_US) {
+      rcLinkConnected = false;
+      rcGoodFrameStreak = 0;
+    }
+  } else if (rcGoodFrameStreak >= RC_GOOD_FRAMES_TO_CONNECT) {
+    rcLinkConnected = true;
+  }
+
+  return !rcLinkConnected;
+}
+
+inline bool depthHoldSwitchHigh() {
+  return digitalRead(PIN_DEPTH_HOLD_ENABLE) == HIGH;
+}
+
+void updateImuAndDepth(float dt) {
+  if (imuOk) {
+    sensors_event_t accEvt, magEvt, gyrEvt, tempEvt;
+    imuLSM.getEvent(&accEvt, &magEvt, &gyrEvt, &tempEvt);
+
+    float accX = (accEvt.acceleration.x / 9.80665f) * IMU_ACC_X_SIGN;
+    float accY = (accEvt.acceleration.y / 9.80665f) * IMU_ACC_Y_SIGN;
+    float accZ = (accEvt.acceleration.z / 9.80665f) * IMU_ACC_Z_SIGN;
+    float gyrX = (gyrEvt.gyro.x * RAD_TO_DEG) * IMU_GYR_X_SIGN;
+    float gyrY = (gyrEvt.gyro.y * RAD_TO_DEG) * IMU_GYR_Y_SIGN;
+    float gyrZ = (gyrEvt.gyro.z * RAD_TO_DEG) * IMU_GYR_Z_SIGN;
+    float tempRaw = tempEvt.temperature;
+
+    bool firstSample = !imuFilterPrimed;
+    if (firstSample) {
+      imuAccX = accX; imuAccY = accY; imuAccZ = accZ;
+      imuGyrX = gyrX; imuGyrY = gyrY; imuGyrZ = gyrZ;
+      imuTempC = tempRaw;
+      imuRollRawFilt = atan2f(accY, accZ) * 180.0f / PI;
+      imuPitchRawFilt = atan2f(-accX, sqrtf(accY * accY + accZ * accZ)) * 180.0f / PI;
+      imuYawRawFilt = 0.0f;
+      imuFilterPrimed = true;
+    } else {
+      imuAccX = lowPass(imuAccX, accX, IMU_ACC_FILTER_ALPHA);
+      imuAccY = lowPass(imuAccY, accY, IMU_ACC_FILTER_ALPHA);
+      imuAccZ = lowPass(imuAccZ, accZ, IMU_ACC_FILTER_ALPHA);
+      imuGyrX = lowPass(imuGyrX, gyrX, IMU_GYR_FILTER_ALPHA);
+      imuGyrY = lowPass(imuGyrY, gyrY, IMU_GYR_FILTER_ALPHA);
+      imuGyrZ = lowPass(imuGyrZ, gyrZ, IMU_GYR_FILTER_ALPHA);
+      imuTempC = lowPass(imuTempC, tempRaw, IMU_TEMP_FILTER_ALPHA);
+    }
+
+    float rollAcc = atan2f(imuAccY, imuAccZ) * 180.0f / PI;
+    float pitchAcc = atan2f(-imuAccX, sqrtf(imuAccY * imuAccY + imuAccZ * imuAccZ)) * 180.0f / PI;
+    float accNormG = sqrtf(imuAccX * imuAccX + imuAccY * imuAccY + imuAccZ * imuAccZ);
+    float gyroNormDps = sqrtf(imuGyrX * imuGyrX + imuGyrY * imuGyrY + imuGyrZ * imuGyrZ);
+    bool accReliable = (fabsf(accNormG - 1.0f) <= IMU_EKF_ACC_G_TRUST) && (gyroNormDps <= IMU_EKF_ACC_MAX_GYRO_DPS);
+
+    if (firstSample) {
+      ekfReset(ekfRollState, rollAcc);
+      ekfReset(ekfPitchState, pitchAcc);
+      imuRollRawFilt = rollAcc;
+      imuPitchRawFilt = pitchAcc;
+    } else {
+      imuRollRawFilt = ekfStepAxis(
+        ekfRollState, imuGyrX, dt, accReliable, rollAcc,
+        IMU_EKF_Q_ANGLE, IMU_EKF_Q_BIAS, IMU_EKF_R_ROLL_PITCH, false
+      );
+      imuPitchRawFilt = ekfStepAxis(
+        ekfPitchState, imuGyrY, dt, accReliable, pitchAcc,
+        IMU_EKF_Q_ANGLE, IMU_EKF_Q_BIAS, IMU_EKF_R_ROLL_PITCH, false
+      );
+    }
+
+    float magXRaw = magEvt.magnetic.x * IMU_MAG_X_SIGN;
+    float magYRaw = magEvt.magnetic.y * IMU_MAG_Y_SIGN;
+    float magZRaw = magEvt.magnetic.z * IMU_MAG_Z_SIGN;
+    bool magDataOk = !isnan(magXRaw) && !isnan(magYRaw) && !isnan(magZRaw);
+    magOk = false;
+    if (magDataOk) {
+      if (firstSample) {
+        magX = magXRaw;
+        magY = magYRaw;
+        magZ = magZRaw;
+      } else {
+        magX = lowPass(magX, magXRaw, IMU_MAG_FILTER_ALPHA);
+        magY = lowPass(magY, magYRaw, IMU_MAG_FILTER_ALPHA);
+        magZ = lowPass(magZ, magZRaw, IMU_MAG_FILTER_ALPHA);
+      }
+
+      float magXUsed = magX;
+      float magYUsed = magY;
+      float magZUsed = magZ;
+      if (MAG_AUTO_CAL_ENABLE) {
+        // Online hard/soft-iron compensation from observed range.
+        magMinX = min(magMinX, magX);
+        magMaxX = max(magMaxX, magX);
+        magMinY = min(magMinY, magY);
+        magMaxY = max(magMaxY, magY);
+        magMinZ = min(magMinZ, magZ);
+        magMaxZ = max(magMaxZ, magZ);
+
+        float spanX = magMaxX - magMinX;
+        float spanY = magMaxY - magMinY;
+        float spanZ = magMaxZ - magMinZ;
+        if (spanX >= MAG_AUTO_CAL_MIN_SPAN_UT && spanY >= MAG_AUTO_CAL_MIN_SPAN_UT) {
+          float offX = 0.5f * (magMaxX + magMinX);
+          float offY = 0.5f * (magMaxY + magMinY);
+          float offZ = 0.5f * (magMaxZ + magMinZ);
+          float avgSpanXY = 0.5f * (spanX + spanY);
+          magXUsed = (magX - offX) * (avgSpanXY / max(1e-3f, spanX));
+          magYUsed = (magY - offY) * (avgSpanXY / max(1e-3f, spanY));
+          if (spanZ >= MAG_AUTO_CAL_MIN_SPAN_UT) {
+            magZUsed = (magZ - offZ) * (avgSpanXY / max(1e-3f, spanZ));
+          } else {
+            magZUsed = (magZ - offZ);
+          }
+        }
+      }
+
+      float magNorm = sqrtf(magXUsed * magXUsed + magYUsed * magYUsed + magZUsed * magZUsed);
+      bool magFieldReliable = (magNorm >= MAG_FIELD_MIN_UT) && (magNorm <= MAG_FIELD_MAX_UT);
+
+      float yawMeas = 0.0f;
+      if (magFieldReliable) {
+        float rollRad = imuRollRawFilt * DEG_TO_RAD;
+        float pitchRad = imuPitchRawFilt * DEG_TO_RAD;
+        float magXComp = magXUsed * cosf(pitchRad) + magZUsed * sinf(pitchRad);
+        float magYComp = magXUsed * sinf(rollRad) * sinf(pitchRad) + magYUsed * cosf(rollRad) - magZUsed * sinf(rollRad) * cosf(pitchRad);
+        float heading = atan2f(magYComp, magXComp) * 180.0f / PI + MAG_DECLINATION_DEG;
+        headingDeg = wrapDeg360(heading);
+        yawMeas = wrapDeg180(headingDeg);
+      }
+
+      if (firstSample) {
+        float yawInit = magFieldReliable ? yawMeas : 0.0f;
+        ekfReset(ekfYawState, yawInit);
+        imuYawRawFilt = yawInit;
+        headingDeg = wrapDeg360(imuYawRawFilt);
+      } else {
+        bool useYawMeas = magFieldReliable;
+        if (useYawMeas) {
+          float yawInnovation = wrapDeg180(yawMeas - ekfYawState.angle);
+          if (fabsf(yawInnovation) > IMU_EKF_YAW_INNOV_MAX_DEG) {
+            float limitedStep = (yawInnovation > 0.0f) ? IMU_EKF_YAW_INNOV_MAX_DEG : -IMU_EKF_YAW_INNOV_MAX_DEG;
+            yawMeas = wrapDeg180(ekfYawState.angle + limitedStep);
+          }
+        }
+        imuYawRawFilt = ekfStepAxis(
+          ekfYawState, imuGyrZ, dt, useYawMeas, yawMeas,
+          IMU_EKF_Q_ANGLE, IMU_EKF_Q_BIAS, IMU_EKF_R_YAW, true
+        );
+        headingDeg = wrapDeg360(imuYawRawFilt);
+      }
+
+      magOk = magFieldReliable;
+    } else {
+      headingDeg = 0.0f;
+      magX = magY = magZ = 0.0f;
+      if (firstSample) {
+        ekfReset(ekfYawState, 0.0f);
+        imuYawRawFilt = 0.0f;
+      } else {
+        imuYawRawFilt = ekfStepAxis(
+          ekfYawState, imuGyrZ, dt, false, 0.0f,
+          IMU_EKF_Q_ANGLE, IMU_EKF_Q_BIAS, IMU_EKF_R_YAW, true
+        );
+      }
+    }
+
+    if (firstSample) {
+      imuFilterPrimed = true;
+    }
+
+    calibrationButtonTask(imuRollRawFilt, imuPitchRawFilt, imuYawRawFilt);
+    rollDeg = imuRollRawFilt - rollLevelOffsetDeg;
+    pitchDeg = imuPitchRawFilt - pitchLevelOffsetDeg;
+    yawDeg = wrapDeg180(imuYawRawFilt - yawLevelOffsetDeg);
+  } else {
+    imuAccX = imuAccY = imuAccZ = 0.0f;
+    imuGyrX = imuGyrY = imuGyrZ = 0.0f;
+    imuTempC = 0.0f;
+    rollDeg = pitchDeg = yawDeg = 0.0f;
+    imuRollRawFilt = imuPitchRawFilt = imuYawRawFilt = 0.0f;
+    imuFilterPrimed = false;
+    ekfReset(ekfRollState, 0.0f);
+    ekfReset(ekfPitchState, 0.0f);
+    ekfReset(ekfYawState, 0.0f);
+    magPresent = false;
+    magOk = false;
+    magX = magY = magZ = 0.0f;
+    magMinX = magMinY = magMinZ = 1e6f;
+    magMaxX = magMaxY = magMaxZ = -1e6f;
+    headingDeg = 0.0f;
+  }
+
+  if (depthOk) {
+    if (depthSensor.read() == 0) {
+      float depthPressureRaw = depthSensor.getPressure();
+      float depthRaw = depthSensor.getDepth();
+      if (!depthFilterPrimed) {
+        depthPressureMbar = depthPressureRaw;
+        depthM = depthRaw;
+        depthFilterPrimed = true;
+      } else {
+        depthPressureMbar = lowPass(depthPressureMbar, depthPressureRaw, DEPTH_FILTER_ALPHA);
+        depthM = lowPass(depthM, depthRaw, DEPTH_FILTER_ALPHA);
+      }
+    }
+  } else {
+    depthPressureMbar = 0.0f;
+    depthM = 0.0f;
+    depthFilterPrimed = false;
+  }
+}
+
+float readBatteryVolts() {
+  if (!HAVE_BATT_SENSE || PIN_BATT_ADC < 0) return 0.0f;
+  int raw = analogRead(PIN_BATT_ADC);
+  float vAdc = (float(raw) / float(ADC_MAX_COUNTS)) * ADC_REF_VOLT;
+  return vAdc * VOLTAGE_DIV_RATIO;
+}
+
+float readCurrentAmps() {
+  if (!HAVE_CURR_SENSE || PIN_CURR_ADC < 0) return 0.0f;
+  int raw = analogRead(PIN_CURR_ADC);
+  float vAdc = (float(raw) / float(ADC_MAX_COUNTS)) * ADC_REF_VOLT;
+  return (vAdc - ACS_ZERO_VOLT) / ACS_SENS_V_PER_A;
+}
+
+void updatePowerReadings() {
+  float battRaw = 0.0f;
+  float currRaw = 0.0f;
+  if (HAVE_BATT_SENSE) {
+    battRaw = readBatteryVolts();
+  }
+  if (HAVE_CURR_SENSE) {
+    currRaw = readCurrentAmps();
+  }
+
+  if (!powerFilterPrimed) {
+    batteryVolts = battRaw;
+    currentAmps = currRaw;
+    powerFilterPrimed = true;
+  } else {
+    if (HAVE_BATT_SENSE) batteryVolts = lowPass(batteryVolts, battRaw, BATT_FILTER_ALPHA);
+    else batteryVolts = 0.0f;
+    if (HAVE_CURR_SENSE) currentAmps = lowPass(currentAmps, currRaw, CURR_FILTER_ALPHA);
+    else currentAmps = 0.0f;
+  }
+
+  lowBattery = HAVE_BATT_SENSE && (batteryVolts > 0.1f) && (batteryVolts < BATT_LOW_VOLTS);
+}
+
+void updateStatusLed(bool isArmed, Mode curMode, bool rcLost, bool imuOkFlag, bool lowBatt) {
+  if (millis() - lastRgbUpdate < 50) return;
+  lastRgbUpdate = millis();
+
+  uint32_t color = 0;
+  if (rcLost) {
+    color = pixel.Color(255, 0, 0);         // red
+  } else if (!imuOkFlag) {
+    color = pixel.Color(255, 0, 255);       // magenta
+  } else if (lowBatt) {
+    color = pixel.Color(255, 80, 0);        // orange
+  } else if (curMode != MANUAL) {
+    color = pixel.Color(0, 0, 255);         // blue (depth hold modes)
+  } else if (isArmed) {
+    color = pixel.Color(0, 255, 0);         // green
+  } else {
+    color = pixel.Color(0, 0, 0);           // off
+  }
+
+  pixel.setPixelColor(0, color);
+  pixel.show();
+}
+
+void initPreferences() {
+  prefsReady = prefs.begin(CAL_NS, false);
+  if (!prefsReady) {
+    DBG_PRINTLN("BOOT: prefs init FAILED");
+  }
+}
+
+void initWatchdog() {
+  // Avoid re-initializing if TWDT is already configured by framework/boot code.
+  esp_err_t status = esp_task_wdt_status(NULL);
+  bool twdtInitialized = (status != ESP_ERR_INVALID_STATE);
+
+  if (!twdtInitialized) {
+#if ESP_IDF_VERSION_MAJOR >= 5
+    esp_task_wdt_config_t config = {};
+    config.timeout_ms = WDT_TIMEOUT_MS;
+    config.idle_core_mask = (1 << portNUM_PROCESSORS) - 1;
+    config.trigger_panic = true;
+    esp_err_t initErr = esp_task_wdt_init(&config);
+#else
+    esp_err_t initErr = esp_task_wdt_init(WDT_TIMEOUT_MS / 1000, true);
+#endif
+    if (initErr != ESP_OK) {
+      if (SERIAL_LOG_ENABLE) Serial.printf("BOOT: WDT init failed err=0x%X\n", unsigned(initErr));
+      return;
+    }
+  }
+
+  subscribeCurrentTaskToWatchdog("loop");
+}
+
+void feedWatchdog() {
+  esp_task_wdt_reset();
+}
+
+void subscribeCurrentTaskToWatchdog(const char *taskName) {
+  esp_err_t status = esp_task_wdt_status(NULL);
+  if (status == ESP_OK) return; // already subscribed
+  if (status == ESP_ERR_NOT_FOUND) {
+    esp_err_t addErr = esp_task_wdt_add(NULL);
+    if (addErr != ESP_OK) {
+      if (SERIAL_LOG_ENABLE) Serial.printf("BOOT: WDT add(%s) failed err=0x%X\n", taskName, unsigned(addErr));
+    }
+    return;
+  }
+  if (status == ESP_ERR_INVALID_STATE) {
+    if (SERIAL_LOG_ENABLE) Serial.printf("BOOT: WDT add(%s) skipped, TWDT not initialized\n", taskName);
+    return;
+  }
+  if (SERIAL_LOG_ENABLE) Serial.printf("BOOT: WDT status(%s) err=0x%X\n", taskName, unsigned(status));
+}
+
+void loadLevelCalibration() {
+  if (!prefsReady) {
+    rollLevelOffsetDeg = 0.0f;
+    pitchLevelOffsetDeg = 0.0f;
+    yawLevelOffsetDeg = 0.0f;
+    DBG_PRINTLN("CAL: prefs not ready, using zeros");
+    return;
+  }
+  bool valid = prefs.getBool(CAL_KEY_VALID, false);
+  if (valid) {
+    rollLevelOffsetDeg = prefs.getFloat(CAL_KEY_ROLL, 0.0f);
+    pitchLevelOffsetDeg = prefs.getFloat(CAL_KEY_PITCH, 0.0f);
+    yawLevelOffsetDeg = prefs.getFloat(CAL_KEY_YAW, 0.0f);
+  } else {
+    rollLevelOffsetDeg = 0.0f;
+    pitchLevelOffsetDeg = 0.0f;
+    yawLevelOffsetDeg = 0.0f;
+  }
+  DBG_PRINTF("CAL: load valid=%d roll=%.2f pitch=%.2f yaw=%.2f\n",
+             valid ? 1 : 0, rollLevelOffsetDeg, pitchLevelOffsetDeg, yawLevelOffsetDeg);
+}
+
+void saveLevelCalibration(float rawRollDeg, float rawPitchDeg, float rawYawDeg) {
+  if (!prefsReady) return;
+  rollLevelOffsetDeg = rawRollDeg;
+  pitchLevelOffsetDeg = rawPitchDeg;
+  yawLevelOffsetDeg = rawYawDeg;
+  size_t w1 = prefs.putFloat(CAL_KEY_ROLL, rollLevelOffsetDeg);
+  size_t w2 = prefs.putFloat(CAL_KEY_PITCH, pitchLevelOffsetDeg);
+  size_t w3 = prefs.putFloat(CAL_KEY_YAW, yawLevelOffsetDeg);
+  bool ok = prefs.putBool(CAL_KEY_VALID, true);
+  DBG_PRINTF("CAL: save roll=%.2f pitch=%.2f yaw=%.2f (w=%u/%u/%u ok=%d)\n",
+             rollLevelOffsetDeg, pitchLevelOffsetDeg, yawLevelOffsetDeg,
+             unsigned(w1), unsigned(w2), unsigned(w3), ok ? 1 : 0);
+}
+
+void calibrationButtonTask(float rawRollDeg, float rawPitchDeg, float rawYawDeg) {
+  static bool lastRawPressed = false;
+  static bool stablePressed = false;
+  static uint32_t lastEdgeMs = 0;
+
+  bool rawPressed = (digitalRead(PIN_CAL_BUTTON) == LOW);
+  if (rawPressed != lastRawPressed) {
+    lastRawPressed = rawPressed;
+    lastEdgeMs = millis();
+  }
+
+  if ((millis() - lastEdgeMs) >= CAL_BTN_DEBOUNCE_MS && rawPressed != stablePressed) {
+    stablePressed = rawPressed;
+    if (stablePressed) {
+      saveLevelCalibration(rawRollDeg, rawPitchDeg, rawYawDeg);
+    }
+  }
+}
+
+bool ibusTask() {
+  static uint8_t lastCnt = 0;
+  ibus.loop(); // using IBUSBM_NOTIMER mode, so poll parser manually
+  uint8_t cnt = ibus.cnt_rec;
+  if (cnt == lastCnt) {
+    return false;
+  }
+  lastCnt = cnt;
+
+  uint16_t frame[14];
+  for (int i = 0; i < 14; i++) frame[i] = ibus.readChannel(i);
+  (void)rcFrameLooksValid(frame);
+
+  for (int i = 0; i < 14; i++) rcRaw[i] = frame[i];
+  lastRcMicros = micros();
+  return true;
+}
+
+void printIbusChannels() {
+  if (MAG_ONLY || I2C_SCAN_ONLY) return;
+  DBG_PRINTF(
+    "IBUS: CH1=%u CH2=%u CH3=%u CH4=%u CH5=%u CH6=%u CH7=%u CH8=%u "
+    "CH9=%u CH10=%u CH11=%u CH12=%u CH13=%u CH14=%u\n",
+    rcRaw[0], rcRaw[1], rcRaw[2], rcRaw[3], rcRaw[4], rcRaw[5], rcRaw[6],
+    rcRaw[7], rcRaw[8], rcRaw[9], rcRaw[10], rcRaw[11], rcRaw[12], rcRaw[13]
+  );
+}
+
+void printSensors() {
+  if (MAG_ONLY) {
+    if (SERIAL_LOG_ENABLE) Serial.printf(
+      "MAG[%s] uT: x=%.2f y=%.2f z=%.2f | heading=%.1f deg\n",
+      magOk ? "LSM9DS1" : "NA",
+      magX, magY, magZ, headingDeg
+    );
+    return;
+  }
+  const char* magTag = magOk ? "LSM9DS1" : "NA";
+  const char* modeTag = (mode == MANUAL) ? "MANUAL" : ((mode == DEPTH_STAB) ? "DEPTH_STAB" : "PITCH_STAB");
+  float dofWeightPct[6];
+  computeDofWeightsPct(thrusterOutCmd, mode, servoFrontDeg, servoRearDeg, dofWeightPct);
+  DBG_PRINTF(
+    "STATE: mode=%s armed=%d rcLost=%d ch8Sway=%d ch9Pitch=%d imu=%d depth=%d depthHold=%d lowBatt=%d\n"
+    "RCIN: CH1=%u CH2=%u CH3=%u CH4=%u CH5=%u CH6=%u CH7=%u CH8=%u CH9=%u CH10=%u CH11=%u CH12=%u CH13=%u CH14=%u\n"
+    "CMD: rollIn=%.2f pitchIn=%.2f heaveIn=%.2f yawIn=%.2f | surge=%.2f sway=%.2f heave=%.2f yaw=%.2f\n"
+    "IMU[%s] acc(g): x=%.3f y=%.3f z=%.3f | gyr(dps): x=%.2f y=%.2f z=%.2f | temp=%.2fC | rpy(deg): roll=%.2f pitch=%.2f yaw=%.2f\n"
+    "MAG[%s] uT: x=%.2f y=%.2f z=%.2f | heading=%.1f deg\n"
+    "DEPTH[%s] pressure=%.2f mbar depth=%.3f m\n"
+    "OUT: servo1=%.1f servo2=%.1f servo3(inv)=%.1f servo4(inv)=%.1f | thrCmd=[%.2f %.2f %.2f %.2f] | escUs=[%d %d %d %d]\n"
+    "DOF%%: surge=%.1f sway=%.1f heave=%.1f roll=%.1f pitch=%.1f yaw=%.1f\n"
+    "POWER: V=%.2f I=%.2fA\n",
+    modeTag, armed ? 1 : 0, rcLostState ? 1 : 0, ch8SwayMode ? 1 : 0, ch9PitchMode ? 1 : 0,
+    imuOk ? 1 : 0, depthOk ? 1 : 0, depthHoldEnabledState ? 1 : 0, lowBattery ? 1 : 0,
+    rcRaw[0], rcRaw[1], rcRaw[2], rcRaw[3], rcRaw[4], rcRaw[5], rcRaw[6], rcRaw[7], rcRaw[8], rcRaw[9], rcRaw[10], rcRaw[11], rcRaw[12], rcRaw[13],
+    cmdRollIn, cmdPitchIn, cmdHeaveIn, cmdYawIn,
+    cmdSurgeOut, cmdSwayOut, cmdHeaveOut, cmdYawOut,
+    imuOk ? "OK" : "NA",
+    imuAccX, imuAccY, imuAccZ,
+    imuGyrX, imuGyrY, imuGyrZ,
+    imuTempC,
+    rollDeg, pitchDeg, yawDeg,
+    magTag,
+    magX, magY, magZ, headingDeg,
+    depthOk ? "OK" : "NA",
+    depthPressureMbar, depthM,
+    servoFrontDeg, servoRearDeg, servo3Deg, servo4Deg,
+    thrusterOutCmd[0], thrusterOutCmd[1], thrusterOutCmd[2], thrusterOutCmd[3],
+    escPwmUs[0], escPwmUs[1], escPwmUs[2], escPwmUs[3],
+    dofWeightPct[0], dofWeightPct[1], dofWeightPct[2], dofWeightPct[3], dofWeightPct[4], dofWeightPct[5],
+    batteryVolts, currentAmps
+  );
+}
+
+void scanI2CBus() {
+  if (!I2C_SCAN_ONLY) return;
+  Wire.setClock(100000);
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      if (SERIAL_LOG_ENABLE) Serial.printf("0x%02X\n", addr);
+    }
+  }
+}
+
+
+// ---------- Sensors init ----------
+bool initIMU() {
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
+  if (!imuLSM.begin()) {
+    magPresent = false;
+    magOk = false;
+    return false;
+  }
+  imuLSM.setupAccel(imuLSM.LSM9DS1_ACCELRANGE_4G, imuLSM.LSM9DS1_ACCELDATARATE_119HZ);
+  imuLSM.setupGyro(imuLSM.LSM9DS1_GYROSCALE_500DPS);
+  imuLSM.setupMag(imuLSM.LSM9DS1_MAGGAIN_4GAUSS);
+  magPresent = true;
+  magOk = true;
+  DBG_PRINTF("BOOT: IMU LSM9DS1 addr XG=0x%02X M=0x%02X\n", LSM9DS1_XG_ADDR, LSM9DS1_M_ADDR);
+  return true;
+}
+
+bool initDepth() {
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
+  if (!depthSensor.begin(0)) {   // 0 = MS5837-30
+    return false;
+  }
+  depthSensor.setDensity(1.025f); // seawater density (g/cm^3)
+  return true;
+}
+
+bool initExternalMag() {
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 100000);
+  // Try HMC5883L first
+  Wire.beginTransmission(HMC5883L_ADDR);
+  if (Wire.endTransmission() == 0) {
+    // 8-average, 15 Hz, normal measurement
+    Wire.beginTransmission(HMC5883L_ADDR);
+    Wire.write(HMC_REG_CONFIG_A);
+    Wire.write(0x70);
+    if (Wire.endTransmission() != 0) return false;
+    // Gain = 1.3 Ga
+    Wire.beginTransmission(HMC5883L_ADDR);
+    Wire.write(HMC_REG_CONFIG_B);
+    Wire.write(0x20);
+    if (Wire.endTransmission() != 0) return false;
+    // Continuous measurement mode
+    Wire.beginTransmission(HMC5883L_ADDR);
+    Wire.write(HMC_REG_MODE);
+    Wire.write(0x00);
+    if (Wire.endTransmission() != 0) return false;
+    return true;
+  }
+
+  // Try QMC5883L (common clone at 0x0D)
+  Wire.beginTransmission(QMC5883L_ADDR);
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+  // Set continuous mode, 200Hz ODR, 2G range, OSR=512
+  Wire.beginTransmission(QMC5883L_ADDR);
+  Wire.write(QMC_REG_CTRL1);
+  Wire.write(0x1D);
+  if (Wire.endTransmission() != 0) return false;
+  // Disable soft reset / set default
+  Wire.beginTransmission(QMC5883L_ADDR);
+  Wire.write(QMC_REG_CTRL2);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) return false;
+  return true;
+}
+
+bool readExternalMag(float &mx, float &my, float &mz) {
+  if (useExternalMag) {
+    // If QMC5883L is present (0x0D), read it
+    Wire.beginTransmission(QMC5883L_ADDR);
+    if (Wire.endTransmission() == 0) {
+      Wire.beginTransmission(QMC5883L_ADDR);
+      Wire.write(QMC_REG_DATA);
+      if (Wire.endTransmission(false) != 0) return false;
+      uint8_t n = Wire.requestFrom(QMC5883L_ADDR, (uint8_t)6);
+      if (n != 6) return false;
+      int16_t x = (int16_t)((Wire.read() | (Wire.read() << 8)));
+      int16_t y = (int16_t)((Wire.read() | (Wire.read() << 8)));
+      int16_t z = (int16_t)((Wire.read() | (Wire.read() << 8)));
+      mx = float(x);
+      my = float(y);
+      mz = float(z);
+      return true;
+    }
+  }
+
+  // Default to HMC5883L (0x1E)
+  Wire.beginTransmission(HMC5883L_ADDR);
+  Wire.write(HMC_REG_DATA);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+  uint8_t n = Wire.requestFrom(HMC5883L_ADDR, (uint8_t)6);
+  if (n != 6) return false;
+  // HMC5883L output order: X, Z, Y
+  int16_t x = (int16_t)((Wire.read() << 8) | Wire.read());
+  int16_t z = (int16_t)((Wire.read() << 8) | Wire.read());
+  int16_t y = (int16_t)((Wire.read() << 8) | Wire.read());
+  mx = float(x);
+  my = float(y);
+  mz = float(z);
+  return true;
+}
+
+
+// ---------- ESC PWM ----------
+bool setupPwmOutputPin(int pin, uint32_t freqHz, const char *tag) {
+  bool ok = ledcAttach((uint8_t)pin, freqHz, PWM_OUTPUT_RES_BITS);
+  DBG_PRINTF("BOOT: %s attach pin=%d freq=%uHz %s\n", tag, pin, unsigned(freqHz), ok ? "OK" : "FAILED");
+  return ok;
+}
+
+void pwmWriteUs(int pin, int pulseUs, uint32_t freqHz) {
+  pulseUs = constrain(pulseUs, PWM_MIN_US, PWM_MAX_US);
+  uint32_t maxDuty = (1u << PWM_OUTPUT_RES_BITS) - 1u;
+  uint32_t duty = (uint32_t)((((float)pulseUs) * freqHz * maxDuty) / 1000000.0f + 0.5f);
+  duty = constrain(duty, 0u, maxDuty);
+  ledcWrite((uint8_t)pin, duty);
+}
+
+inline int throttleToEscUs(float t, bool &neutralLatch) {
+  t = constrain(t, -1.f, 1.f);
+  int usLinear = int(mapf(t, -1.0f, 1.0f, float(ESC_US_REV), float(ESC_US_FWD)));
+  int centerErrUs = abs(usLinear - ESC_US_STOP);
+  int enterNeutralUs = max(0, ESC_CENTER_DEADZONE_US - ESC_CENTER_HYST_US);
+  int exitNeutralUs = ESC_CENTER_DEADZONE_US + ESC_CENTER_HYST_US;
+
+  if (neutralLatch) {
+    if (centerErrUs <= exitNeutralUs) return ESC_US_STOP;
+    neutralLatch = false;
+  } else {
+    if (centerErrUs <= enterNeutralUs) {
+      neutralLatch = true;
+      return ESC_US_STOP;
+    }
+  }
+
+  float deadbandCmd = float(ESC_CENTER_DEADZONE_US) / float(ESC_US_FWD - ESC_US_STOP);
+  float cmdAbs = fabsf(t);
+  float normLinear = constrain((cmdAbs - deadbandCmd) / max(1e-4f, 1.0f - deadbandCmd), 0.0f, 1.0f);
+  bool isForward = (t >= 0.0f);
+  float expo = isForward ? ESC_FWD_CMD_EXPO : ESC_REV_CMD_EXPO;
+  float gain = isForward ? ESC_FWD_CMD_GAIN : ESC_REV_CMD_GAIN;
+  float norm = constrain(powf(normLinear, expo) * gain, 0.0f, 1.0f);
+  int spanFromCenter = (ESC_US_FWD - ESC_US_STOP) - ESC_MIN_START_US;
+  int signedOffset = ESC_MIN_START_US + int(norm * float(spanFromCenter) + 0.5f);
+  int us = isForward ? (ESC_US_STOP + signedOffset) : (ESC_US_STOP - signedOffset);
+  return constrain(us, ESC_US_REV, ESC_US_FWD);
+}
+
+void sendEscs(float t1,float t2,float t3,float t4) {
+  float rawCmd[4] = {
+    constrain(t1, -1.0f, 1.0f),
+    constrain(t2, -1.0f, 1.0f),
+    constrain(t3, -1.0f, 1.0f),
+    constrain(t4, -1.0f, 1.0f)
+  };
+  static bool thrusterFilterPrimed = false;
+  static float thrusterCmdFilt[4] = {0, 0, 0, 0};
+  if (!thrusterFilterPrimed) {
+    for (int i = 0; i < 4; i++) thrusterCmdFilt[i] = rawCmd[i];
+    thrusterFilterPrimed = true;
+  } else {
+    for (int i = 0; i < 4; i++) {
+      bool rawNearCenter = fabsf(rawCmd[i]) <= THRUSTER_CENTER_CMD_EPS;
+      float alpha = THRUSTER_CMD_FILTER_ALPHA;
+      if (rawNearCenter) {
+        alpha = (thrusterCmdFilt[i] < 0.0f)
+          ? THRUSTER_FILTER_TO_STOP_FROM_REV_ALPHA
+          : THRUSTER_FILTER_TO_STOP_FROM_FWD_ALPHA;
+      }
+      thrusterCmdFilt[i] = lowPass(thrusterCmdFilt[i], rawCmd[i], alpha);
+    }
+  }
+
+  static bool escNeutralLatch[4] = {true, true, true, true};
+  int targetUs[4] = {
+    throttleToEscUs(thrusterCmdFilt[0], escNeutralLatch[0]),
+    throttleToEscUs(thrusterCmdFilt[1], escNeutralLatch[1]),
+    throttleToEscUs(thrusterCmdFilt[2], escNeutralLatch[2]),
+    throttleToEscUs(thrusterCmdFilt[3], escNeutralLatch[3])
+  };
+
+  static float escSlewUs[4] = {
+    float(ESC_US_STOP), float(ESC_US_STOP), float(ESC_US_STOP), float(ESC_US_STOP)
+  };
+  static uint32_t lastUpdateUs = 0;
+  uint32_t nowUs = micros();
+  float dtS = (lastUpdateUs == 0) ? 0.0025f : (nowUs - lastUpdateUs) * 1e-6f;
+  lastUpdateUs = nowUs;
+  dtS = constrain(dtS, 0.001f, 0.05f);
+
+  for (int i = 0; i < 4; i++) {
+    float slewRate = ESC_SLEW_US_PER_SEC_FWD;
+    if (targetUs[i] < ESC_US_STOP) slewRate = ESC_SLEW_US_PER_SEC_REV;
+    if (targetUs[i] == ESC_US_STOP) {
+      slewRate = (escSlewUs[i] < float(ESC_US_STOP))
+        ? ESC_SLEW_US_PER_SEC_TO_STOP_FROM_REV
+        : ESC_SLEW_US_PER_SEC_TO_STOP_FROM_FWD;
+    }
+    float maxDeltaUs = slewRate * dtS;
+    escSlewUs[i] = slewLimit(escSlewUs[i], float(targetUs[i]), maxDeltaUs);
+    escPwmUs[i] = int(escSlewUs[i] + 0.5f);
+  }
+
+  int escHwUs[4] = {escPwmUs[0], escPwmUs[1], escPwmUs[2], escPwmUs[3]};
+  for (int i = 0; i < 4; i++) {
+    if (THRUSTER_HW_DIR[i] < 0.0f) {
+      // Mirror around neutral for hardware reversal; keep debug escPwmUs logical.
+      int mirrored = ESC_US_STOP - (escHwUs[i] - ESC_US_STOP);
+      escHwUs[i] = constrain(mirrored, ESC_US_REV, ESC_US_FWD);
+    }
+  }
+
+  if (!pwmOutputsReady) return;
+  pwmWriteUs(PIN_ESC1, escHwUs[0], ESC_PWM_FREQ_HZ);
+  pwmWriteUs(PIN_ESC2, escHwUs[1], ESC_PWM_FREQ_HZ);
+  pwmWriteUs(PIN_ESC3, escHwUs[2], ESC_PWM_FREQ_HZ);
+  pwmWriteUs(PIN_ESC4, escHwUs[3], ESC_PWM_FREQ_HZ);
+}
+
+// ---------- Servo ----------
+inline void writeServo(int pin, float deg) {
+  deg = constrain(deg, SERVO_DEG_FORWARD, SERVO_DEG_UP);
+  if (!pwmOutputsReady) return;
+  int servoUs = int(mapf(deg, SERVO_DEG_FORWARD, SERVO_DEG_UP, float(SERVO_US_FORWARD), float(SERVO_US_UP)) + 0.5f);
+  pwmWriteUs(pin, servoUs, SERVO_PWM_FREQ_HZ);
+}
+
+// ---------- Control loop (Core 0) ----------
+void controlLoop(void*) {
+  uint32_t lastLoopMicros = micros();
+  uint32_t lastDebug = millis();
+  bool depthHoldPrev = false;
+  subscribeCurrentTaskToWatchdog("control");
+  for (;;) {
+    uint32_t now = micros();
+    float dt = (now - lastLoopMicros) * 1e-6f;
+    lastLoopMicros = now;
+    dt = constrain(dt, 0.001f, 0.05f);
+    feedWatchdog();
+    bool gotValidRcFrame = ibusTask();
+    bool rcLost = updateRcLinkState(gotValidRcFrame);
+    bool failsafe = rcLost;
+    int modePwm = rcRaw[RC_CH_MODE];
+    if (failsafe) {
+      mode = DEPTH_STAB;
+    } else if (modePwm < 1300) {
+      mode = MANUAL;
+    } else if (modePwm < 1700) {
+      mode = DEPTH_STAB;
+    } else {
+      mode = PITCH_STAB;
+    }
+
+    int armPwm = rcRaw[RC_CH_ARM];
+    if (!failsafe) {
+      if (armPwm > 1700) {
+        armed = true;
+      } else if (armPwm < 1300) {
+        armed = false;
+      }
+
+      int ch8Pwm = rcRaw[RC_CH_SWAY_SEL];
+      if (ch8Pwm > 1700) ch8SwayMode = true;
+      else if (ch8Pwm < 1300) ch8SwayMode = false;
+
+      int ch9Pwm = rcRaw[RC_CH_PITCH_SEL];
+      if (ch9Pwm > 1700) ch9PitchMode = true;
+      else if (ch9Pwm < 1300) ch9PitchMode = false;
+    }
+
+    updateImuAndDepth(dt);
+    updatePowerReadings();
+
+    bool depthHoldEnabled = depthHoldSwitchHigh() && depthOk && !failsafe;
+    if (depthHoldEnabled && !depthHoldPrev) {
+      depthTarget = depthM; // latch current depth when switch goes HIGH
+      pidDepth.reset();
+    } else if (!depthHoldEnabled && depthHoldPrev) {
+      pidDepth.reset();
+    }
+    depthHoldPrev = depthHoldEnabled;
+    depthHoldEnabledState = depthHoldEnabled;
+    if (!depthHoldEnabled && !failsafe) {
+      depthTarget = depthM;
+    }
+
+
+    float cmdRoll  = rcLost ? 0 : applyDeadband(rcNorm(RC_CH_ROLL_SWAY), RC_CMD_DEADBAND);
+    float cmdPitch = rcLost ? 0 : applyDeadband(rcNorm(RC_CH_PITCH_SURGE), RC_CMD_DEADBAND);
+    float cmdHeave = rcLost ? 0 : applyDeadband(rcNorm(RC_CH_HEAVE), RC_CMD_DEADBAND);
+    float cmdYaw   = rcLost ? 0 : applyDeadband(rcNorm(RC_CH_YAW), RC_CMD_DEADBAND);
+    int srvFrontUs = rcLost ? ESC_US_STOP : constrain(int(rcRaw[RC_CH_SERVO_FRONT]), SERVO_US_FORWARD, SERVO_US_UP);
+    int srvRearUs  = rcLost ? ESC_US_STOP : constrain(int(rcRaw[RC_CH_SERVO_REAR]),  SERVO_US_FORWARD, SERVO_US_UP);
+
+    if (failsafe) {
+      cmdRoll = 0.0f;
+      cmdPitch = 0.0f;
+      cmdYaw = 0.0f;
+      cmdHeave = 0.0f;
+      srvFrontUs = ESC_US_STOP;
+      srvRearUs = ESC_US_STOP;
+    }
+
+    float surge = cmdPitch;
+    float sway  = 0.0f;
+    float yaw   = cmdYaw;
+    float heave = cmdHeave;
+
+    float rollCorr=0, pitchCorr=0, yawCorr=0, depthCorr=0;
+
+    float servoFrontTargetDeg;
+    float servoRearTargetDeg;
+    float servoFrontManualTargetDeg = mapf(float(srvFrontUs), float(SERVO_US_FORWARD), float(SERVO_US_UP), SERVO_DEG_FORWARD, SERVO_DEG_UP);
+    float servoRearManualTargetDeg  = mapf(float(srvRearUs),  float(SERVO_US_FORWARD), float(SERVO_US_UP), SERVO_DEG_FORWARD, SERVO_DEG_UP);
+    bool useRcServoTargets = (mode == MANUAL) || SERVO_USE_RC_CH5_CH7_IN_ALL_MODES;
+    if (failsafe) {
+      servoFrontTargetDeg = SERVO_DEG_UP;
+      servoRearTargetDeg  = SERVO_DEG_UP;
+    } else if (useRcServoTargets) {
+      servoFrontTargetDeg = servoFrontManualTargetDeg;
+      servoRearTargetDeg  = servoRearManualTargetDeg;
+    } else if (mode == DEPTH_STAB) {
+      float Hmag = max(0.001f, sqrtf(surge*surge + sway*sway));
+      float Vmag = fabs(cmdHeave);
+      float theta = SERVO_DEG_FORWARD + atan2f(Vmag, Hmag) * 180.0f / PI;
+      theta = constrain(theta, SERVO_DEG_FORWARD, SERVO_DEG_UP);
+      servoFrontTargetDeg = theta;
+      servoRearTargetDeg  = theta;
+    } else { // PITCH_STAB
+      // Front servo fixed vertical, rear servo blends between horizontal/vertical.
+      float Hmag = max(0.001f, fabsf(surge) + fabsf(cmdYaw));
+      float Vmag = fabsf(cmdHeave);
+      float theta = SERVO_DEG_FORWARD + atan2f(Vmag, Hmag) * 180.0f / PI;
+      theta = constrain(theta, SERVO_DEG_FORWARD, SERVO_DEG_UP);
+      servoFrontTargetDeg = SERVO_DEG_UP;
+      servoRearTargetDeg  = theta;
+    }
+
+    bool useDirectRcServo =
+      (!failsafe) &&
+      useRcServoTargets &&
+      SERVO_RC_DIRECT_TRACKING;
+
+    if (useDirectRcServo) {
+      servoFrontDeg = servoFrontManualTargetDeg;
+      servoRearDeg  = servoRearManualTargetDeg;
+    } else {
+      static bool servoTargetFilterPrimed = false;
+      static float servoFrontTargetFilt = 90.0f;
+      static float servoRearTargetFilt = 90.0f;
+      if (!servoTargetFilterPrimed) {
+        servoFrontTargetFilt = servoFrontTargetDeg;
+        servoRearTargetFilt = servoRearTargetDeg;
+        servoTargetFilterPrimed = true;
+      } else {
+        servoFrontTargetFilt = lowPass(servoFrontTargetFilt, servoFrontTargetDeg, SERVO_FRONT_FILTER_ALPHA);
+        servoRearTargetFilt = lowPass(servoRearTargetFilt, servoRearTargetDeg, SERVO_REAR_FILTER_ALPHA);
+      }
+
+      float maxServoDelta = SERVO_SLEW_DEG_PER_SEC * dt;
+      servoFrontDeg = slewLimit(servoFrontDeg, servoFrontTargetFilt, maxServoDelta);
+      servoRearDeg  = slewLimit(servoRearDeg,  servoRearTargetFilt,  maxServoDelta);
+    }
+
+    float servoAvgDeg = 0.5f * (servoFrontDeg + servoRearDeg);
+    float depthGate = depthAxisFactor(servoAvgDeg);
+    float yawGate = yawAxisFactor(servoAvgDeg);
+    if (mode == PITCH_STAB) {
+      // In PITCH_STAB, gating is handled at the mixer (rear servo angle).
+      depthGate = 1.0f;
+      yawGate = 1.0f;
+    }
+
+    if (mode == MANUAL) {
+      heave = cmdHeave;
+      rollCorr = 0.0f;
+      pitchCorr = 0.0f;
+      yawCorr = 0.0f;
+      depthCorr = 0.0f;
+
+      // CH8 switch: 1000 -> roll, 2000 -> sway on CH1.
+      if (ch8SwayMode) {
+        sway = cmdRoll;
+      } else {
+        rollCorr = cmdRoll * MANUAL_ROLL_GAIN;
+      }
+
+      // CH9 switch: 1000 -> surge, 2000 -> pitch on CH2.
+      if (ch9PitchMode) {
+        surge = 0.0f;
+        pitchCorr = cmdPitch * MANUAL_PITCH_GAIN;
+      } else {
+        surge = cmdPitch;
+      }
+    } else {
+      float rollSetDeg = failsafe ? 0.0f : cmdRoll * 30.f;
+      float pitchSetDeg = failsafe ? 0.0f : cmdPitch * 30.f;
+      float yawRateSet = failsafe ? 0.0f : cmdYaw * 120.f; // deg/s target
+
+      float rollErrDeg = rollSetDeg - rollDeg;
+      float pitchErrDeg = pitchSetDeg - pitchDeg;
+      float yawRateErr = yawRateSet - imuGyrZ;
+
+      float rollPid = pidRoll.update(rollSetDeg, rollDeg, dt);
+      float pitchPid = pidPitch.update(pitchSetDeg, pitchDeg, dt);
+      float yawPid = pidYaw.update(yawRateSet, imuGyrZ, dt);
+
+      // Priority in stabilizer modes:
+      // 1) user input, 2) large-error correction, 3) small correction, 4) ignore tiny errors.
+      rollCorr  = stabilizerCorrection(rollPid, fabsf(rollErrDeg), STAB_ROLL_DB_DEG, STAB_ROLL_HIGH_DEG);
+      pitchCorr = stabilizerCorrection(pitchPid, fabsf(pitchErrDeg), STAB_PITCH_DB_DEG, STAB_PITCH_HIGH_DEG);
+      yawCorr   = stabilizerCorrection(yawPid, fabsf(yawRateErr), STAB_YAWRATE_DB_DPS, STAB_YAWRATE_HIGH_DPS) * yawGate;
+
+      // Keep pilot authority highest by adding corrections on top of stick commands.
+      heave = cmdHeave;
+      yaw   = failsafe ? 0.0f : constrain(cmdYaw + yawCorr, -1.0f, 1.0f);
+    }
+
+    // Depth hold is controlled only by dedicated GPIO (or failsafe behavior).
+    if (failsafe) {
+      if (depthOk) {
+        depthTarget = FAILSAFE_DEPTH_TARGET;
+        float depthErrM = depthTarget - depthM;
+        float depthPid = pidDepth.update(depthTarget, depthM, dt);
+        depthCorr = stabilizerCorrection(depthPid, fabsf(depthErrM), STAB_DEPTH_DB_M, STAB_DEPTH_HIGH_M) * depthGate;
+        heave = constrain(depthCorr, -1.0f, 1.0f);
+      } else {
+        depthCorr = 0.0f;
+        heave = FAILSAFE_HEAVE_CMD;
+      }
+    } else if (depthHoldEnabled) {
+      float depthErrM = depthTarget - depthM;
+      float depthPid = pidDepth.update(depthTarget, depthM, dt);
+      depthCorr = stabilizerCorrection(depthPid, fabsf(depthErrM), STAB_DEPTH_DB_M, STAB_DEPTH_HIGH_M) * depthGate;
+      heave = constrain(depthCorr, -1.0f, 1.0f);
+    } else {
+      depthCorr = 0.0f;
+    }
+
+    float H1 = MIX_SURGE[0] * surge + MIX_SWAY[0] * sway + MIX_YAW[0] * yaw;
+    float H2 = MIX_SURGE[1] * surge + MIX_SWAY[1] * sway + MIX_YAW[1] * yaw;
+    float H3 = MIX_SURGE[2] * surge + MIX_SWAY[2] * sway + MIX_YAW[2] * yaw;
+    float H4 = MIX_SURGE[3] * surge + MIX_SWAY[3] * sway + MIX_YAW[3] * yaw;
+
+    float V1, V2, V3, V4;
+    if (mode == PITCH_STAB) {
+      float frontVert = depthAxisFactor(servoFrontDeg);
+      float rearVert = depthAxisFactor(servoRearDeg);
+      float rearHoriz = yawAxisFactor(servoRearDeg);
+      // Gate horizontal commands for rear thrusters only.
+      H3 *= rearHoriz;
+      H4 *= rearHoriz;
+
+      float heaveFront = heave * frontVert;
+      float rollFront = rollCorr * frontVert;
+      float heaveRear  = heave * rearVert;
+      float rollRear  = rollCorr * rearVert;
+      float pitchFront = pitchCorr;
+
+      V1 = heaveFront + MIX_ROLL[0] * rollFront + MIX_PITCH[0] * pitchFront;
+      V2 = heaveFront + MIX_ROLL[1] * rollFront + MIX_PITCH[1] * pitchFront;
+      V3 = heaveRear  + MIX_ROLL[2] * rollRear; // no pitch on rear
+      V4 = heaveRear  + MIX_ROLL[3] * rollRear; // no pitch on rear
+    } else {
+      V1 = heave + MIX_ROLL[0] * rollCorr + MIX_PITCH[0] * pitchCorr;
+      V2 = heave + MIX_ROLL[1] * rollCorr + MIX_PITCH[1] * pitchCorr;
+      V3 = heave + MIX_ROLL[2] * rollCorr + MIX_PITCH[2] * pitchCorr;
+      V4 = heave + MIX_ROLL[3] * rollCorr + MIX_PITCH[3] * pitchCorr;
+    }
+
+    float T1, T2, T3, T4;
+    if (mode == MANUAL) {
+      // MANUAL: ESC mix is independent from servo angle.
+      T1 = H1 + V1;
+      T2 = H2 + V2;
+      T3 = H3 + V3;
+      T4 = H4 + V4;
+    } else {
+      // DEPTH_STAB: use servo tilt for horizontal/vertical projection.
+      // Mechanical reference:
+      // 45 deg  -> fully forward (horizontal)
+      // 135 deg -> fully up (vertical)
+      float tiltFront = (servoFrontDeg - SERVO_DEG_FORWARD) * DEG_TO_RAD;
+      float tiltRear  = (servoRearDeg  - SERVO_DEG_FORWARD) * DEG_TO_RAD;
+      float ctFront = cosf(tiltFront);
+      float stFront = sinf(tiltFront);
+      float ctRear  = cosf(tiltRear);
+      float stRear  = sinf(tiltRear);
+
+      T1 = H1 * ctFront + V1 * stFront;
+      T2 = H2 * ctFront + V2 * stFront;
+      T3 = H3 * ctRear  + V3 * stRear;
+      T4 = H4 * ctRear  + V4 * stRear;
+    }
+
+    float maxAbs = max(max(fabs(T1), fabs(T2)), max(fabs(T3), fabs(T4)));
+    if (maxAbs > 1.0f) { T1/=maxAbs; T2/=maxAbs; T3/=maxAbs; T4/=maxAbs; }
+
+    if (!armed) T1=T2=T3=T4=0;
+
+    rcLostState = rcLost;
+    cmdRollIn = cmdRoll;
+    cmdPitchIn = cmdPitch;
+    cmdHeaveIn = cmdHeave;
+    cmdYawIn = cmdYaw;
+    cmdSurgeOut = surge;
+    cmdSwayOut = sway;
+    cmdHeaveOut = heave;
+    cmdYawOut = yaw;
+    thrusterOutCmd[0] = T1;
+    thrusterOutCmd[1] = T2;
+    thrusterOutCmd[2] = T3;
+    thrusterOutCmd[3] = T4;
+
+    servo3Deg = SERVO_DEG_FORWARD + SERVO_DEG_UP - servoFrontDeg;
+    servo4Deg = SERVO_DEG_FORWARD + SERVO_DEG_UP - servoRearDeg;
+
+    sendEscs(T1,T2,T3,T4);
+    writeServo(PIN_SERVO_FRONT, servoFrontDeg);
+    writeServo(PIN_SERVO_REAR,  servoRearDeg);
+    writeServo(PIN_SERVO_FRONT_MIRROR, servo3Deg);
+    writeServo(PIN_SERVO_REAR_MIRROR,  servo4Deg);
+    updateStatusLed(armed, mode, rcLost, imuOk, lowBattery);
+
+    // -------- Debug print every 200 ms --------
+    if (millis() - lastDebug >= 200) {
+      lastDebug = millis();
+      if (SERIAL_LOG_ENABLE) {
+        printSensors();
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2)); // ~400 Hz
+  }
+}
+
+// ---------- Telemetry (Core 1) ----------
+void telemetryLoop(void*) {
+  subscribeCurrentTaskToWatchdog("telemetry");
+  for (;;) {
+    feedWatchdog();
+    vTaskDelay(pdMS_TO_TICKS(20)); // kept minimal; main debug in controlLoop
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  pixel.begin();
+  pixel.setBrightness(40);
+  pixel.show();
+  DBG_PRINTLN("BOOT: setup start");
+  pinMode(PIN_CAL_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_DEPTH_HOLD_ENABLE, INPUT_PULLDOWN);
+  initWatchdog();
+  initPreferences();
+  loadLevelCalibration();
+  DBG_PRINTLN("BOOT: calibration loaded");
+
+  ibus.begin(Serial1, IBUSBM_NOTIMER, PIN_IBUS_RX, PIN_IBUS_TX);
+  for (int i = 0; i < 14; i++) rcRaw[i] = 1500; // neutral defaults until first iBus frame
+  DBG_PRINTLN("BOOT: iBus init done");
+
+  imuOk = initIMU();
+  DBG_PRINTF("BOOT: IMU init %s\n", imuOk ? "OK" : "FAILED");
+  depthOk = initDepth();
+  DBG_PRINTF("BOOT: Depth init %s\n", depthOk ? "OK" : "FAILED");
+  analogReadResolution(12);
+  if (HAVE_BATT_SENSE && PIN_BATT_ADC >= 0) {
+    pinMode(PIN_BATT_ADC, INPUT);
+#if defined(ADC_11db)
+    analogSetPinAttenuation(PIN_BATT_ADC, ADC_11db);
+#endif
+  }
+  if (HAVE_CURR_SENSE && PIN_CURR_ADC >= 0) {
+    pinMode(PIN_CURR_ADC, INPUT);
+#if defined(ADC_11db)
+    analogSetPinAttenuation(PIN_CURR_ADC, ADC_11db);
+#endif
+  }
+  useExternalMag = false; // LSM9DS1 internal magnetometer is used
+  scanI2CBus();
+
+  if (IBUS_DEBUG_ONLY) {
+    DBG_PRINTLN("BOOT: iBus debug-only mode");
+    return;
+  }
+
+  DBG_PRINTLN("BOOT: PWM attach start");
+  bool esc1Ok = setupPwmOutputPin(PIN_ESC1, ESC_PWM_FREQ_HZ, "ESC1");
+  bool esc2Ok = setupPwmOutputPin(PIN_ESC2, ESC_PWM_FREQ_HZ, "ESC2");
+  bool esc3Ok = setupPwmOutputPin(PIN_ESC3, ESC_PWM_FREQ_HZ, "ESC3");
+  bool esc4Ok = setupPwmOutputPin(PIN_ESC4, ESC_PWM_FREQ_HZ, "ESC4");
+  bool srvFrontOk = setupPwmOutputPin(PIN_SERVO_FRONT, SERVO_PWM_FREQ_HZ, "SERVO_FRONT");
+  bool srvRearOk = setupPwmOutputPin(PIN_SERVO_REAR, SERVO_PWM_FREQ_HZ, "SERVO_REAR");
+  bool srv3Ok = setupPwmOutputPin(PIN_SERVO_FRONT_MIRROR, SERVO_PWM_FREQ_HZ, "SERVO3_INV");
+  bool srv4Ok = setupPwmOutputPin(PIN_SERVO_REAR_MIRROR, SERVO_PWM_FREQ_HZ, "SERVO4_INV");
+  pwmOutputsReady = esc1Ok && esc2Ok && esc3Ok && esc4Ok && srvFrontOk && srvRearOk && srv3Ok && srv4Ok;
+  DBG_PRINTF("BOOT: PWM outputs %s\n", pwmOutputsReady ? "READY" : "PARTIAL/FAILED");
+  sendEscs(0, 0, 0, 0); // neutral
+  servo3Deg = SERVO_DEG_FORWARD + SERVO_DEG_UP - servoFrontDeg;
+  servo4Deg = SERVO_DEG_FORWARD + SERVO_DEG_UP - servoRearDeg;
+  writeServo(PIN_SERVO_FRONT, servoFrontDeg);
+  writeServo(PIN_SERVO_REAR,  servoRearDeg);
+  writeServo(PIN_SERVO_FRONT_MIRROR, servo3Deg);
+  writeServo(PIN_SERVO_REAR_MIRROR,  servo4Deg);
+  DBG_PRINTLN("BOOT: PWM attach done");
+
+  BaseType_t controlTaskOk = xTaskCreatePinnedToCore(controlLoop, "control", 8192, nullptr, 3, nullptr, 0);
+  DBG_PRINTF("BOOT: control task create=%d\n", int(controlTaskOk));
+  BaseType_t telemetryTaskOk = xTaskCreatePinnedToCore(telemetryLoop, "telemetry", 4096, nullptr, 1, nullptr, 1);
+  DBG_PRINTF("BOOT: telemetry task create=%d\n", int(telemetryTaskOk));
+  DBG_PRINTLN("BOOT: tasks started");
+}
+
+void loop() {
+  if (IBUS_DEBUG_ONLY) {
+    static uint32_t lastIbusPrint = 0;
+    feedWatchdog();
+    bool gotValidRcFrame = ibusTask();
+    bool rcLost = updateRcLinkState(gotValidRcFrame);
+    bool failsafe = rcLost;
+    int modePwm = rcRaw[RC_CH_MODE];
+    if (failsafe) {
+      mode = DEPTH_STAB;
+    } else if (modePwm < 1300) {
+      mode = MANUAL;
+    } else if (modePwm < 1700) {
+      mode = DEPTH_STAB;
+    } else {
+      mode = PITCH_STAB;
+    }
+
+    int armPwm = rcRaw[RC_CH_ARM];
+    if (!failsafe) {
+      if (armPwm > 1700) {
+        armed = true;
+      } else if (armPwm < 1300) {
+        armed = false;
+      }
+      int ch8Pwm = rcRaw[RC_CH_SWAY_SEL];
+      if (ch8Pwm > 1700) ch8SwayMode = true;
+      else if (ch8Pwm < 1300) ch8SwayMode = false;
+      int ch9Pwm = rcRaw[RC_CH_PITCH_SEL];
+      if (ch9Pwm > 1700) ch9PitchMode = true;
+      else if (ch9Pwm < 1300) ch9PitchMode = false;
+    }
+
+    static uint32_t lastImuMicros = micros();
+    uint32_t nowUs = micros();
+    float dt = (nowUs - lastImuMicros) * 1e-6f;
+    lastImuMicros = nowUs;
+    dt = constrain(dt, 0.001f, 0.05f);
+    updateImuAndDepth(dt);
+    updatePowerReadings();
+    depthHoldEnabledState = depthHoldSwitchHigh() && depthOk && !failsafe;
+    cmdRollIn = rcLost ? 0 : applyDeadband(rcNorm(RC_CH_ROLL_SWAY), RC_CMD_DEADBAND);
+    cmdPitchIn = rcLost ? 0 : applyDeadband(rcNorm(RC_CH_PITCH_SURGE), RC_CMD_DEADBAND);
+    cmdHeaveIn = rcLost ? 0 : applyDeadband(rcNorm(RC_CH_HEAVE), RC_CMD_DEADBAND);
+    cmdYawIn = rcLost ? 0 : applyDeadband(rcNorm(RC_CH_YAW), RC_CMD_DEADBAND);
+    cmdSurgeOut = (mode == MANUAL && ch9PitchMode) ? 0.0f : cmdPitchIn;
+    cmdSwayOut = (mode == MANUAL && ch8SwayMode) ? cmdRollIn : 0.0f;
+    cmdHeaveOut = cmdHeaveIn;
+    cmdYawOut = cmdYawIn;
+    rcLostState = rcLost;
+    updateStatusLed(armed, mode, rcLost, imuOk, lowBattery);
+    if (millis() - lastIbusPrint >= 200) {
+      lastIbusPrint = millis();
+      if (SERIAL_LOG_ENABLE) {
+        printSensors();
+      }
+    }
+    delay(2);
+  } else {
+    // In full mode control/telemetry tasks run separately, but loop task
+    // is still watchdog-registered, so it must keep feeding.
+    feedWatchdog();
+    delay(20);
+  }
+}

@@ -1,0 +1,596 @@
+# Autonomous Underwater ROV System
+
+## Technical Specification / Product Requirements Document (PRD)
+
+### Project
+
+Autonomous Underwater ROV for Robofest 5.0 Competition
+
+### Hardware Platform
+
+Primary compute:
+
+* Raspberry Pi 4 Model B
+
+Camera:
+
+* Raspberry Pi Camera Module 2
+  *(Possible future upgrade: Raspberry Pi Camera Module 3)*
+
+Communication protocol for control:
+
+* iBus (UART)
+
+Additional sensors:
+
+* IMU (orientation stabilization)
+* Depth sensor (depth holding)
+
+Microcontroller:
+
+* ESP32 / flight controller for thruster control
+
+---
+
+# 1. System Overview
+
+The system is an **autonomous underwater ROV** designed to complete a defined underwater mission course.
+
+Mission tasks include:
+
+1. Enter pool through start gate (3 ft × 3 ft)
+2. Move forward while avoiding an orange flare obstacle
+3. Detect and pass through qualification gate (4 ft × 4 ft)
+4. Perform 180° U-turn
+5. Pass back through gate in reverse direction
+6. Navigate to green mat (8 m × 2 m)
+7. Detect 3 red drums and 1 blue drum
+8. Identify blue drum
+9. Drop ball into blue drum
+10. Generate digital 2D map of drum positions
+11. Exit pool through designated finish gate (3 ft × 3 ft)
+
+The robot must operate **fully autonomous underwater** without wireless communication.
+
+---
+
+# 2. System Architecture
+
+### High Level Architecture
+
+```
+Camera → Raspberry Pi → Vision Processing
+                        ↓
+                  Navigation Logic
+                        ↓
+                 Motion Commands
+                        ↓
+                 iBus Command Output
+                        ↓
+             ESP32 / Flight Controller
+                        ↓
+               ESC → Thrusters
+```
+
+### Responsibility Separation
+
+Raspberry Pi responsibilities:
+
+* computer vision
+* mission state machine
+* navigation decision logic
+* object detection
+* iBus command generation
+
+Microcontroller responsibilities:
+
+* thruster control
+* PWM signal output
+* stabilization loops
+* safety systems
+
+---
+
+# 3. Mission Environment
+
+Pool obstacles:
+
+| Object             | Description                  |
+| ------------------ | ---------------------------- |
+| Start gate         | 3 ft × 3 ft square entry     |
+| Qualification gate | 4 ft × 4 ft metal pipe frame |
+| Obstacle           | 1 orange flare               |
+| Target area        | green mat 8 m × 2 m          |
+| Objects            | 3 red drums + 1 blue drum    |
+| Exit gate          | 3 ft × 3 ft finish area      |
+
+Lighting conditions:
+
+* underwater
+* potentially low visibility
+* artificial lighting recommended
+
+---
+
+# 4. Camera System
+
+Resolution used for processing:
+
+```
+640 × 480
+```
+
+Reason:
+
+* faster OpenCV processing
+* sufficient accuracy for object detection
+
+Frame rate target:
+
+```
+20–30 FPS
+```
+
+Camera tilt:
+
+```
+10–15° downward
+```
+
+Purpose:
+
+* see ground objects (drums/mat)
+* maintain forward visibility
+
+---
+
+# 5. Computer Vision System
+
+Computer vision will use:
+
+* OpenCV
+* HSV color segmentation
+* contour detection
+* edge detection
+
+No machine learning required.
+
+---
+
+# 6. Object Detection
+
+### Orange Flare Detection
+
+Method:
+HSV color threshold
+
+Pipeline:
+
+```
+RGB frame
+↓
+Convert to HSV
+↓
+Orange mask
+↓
+Find contours
+↓
+Calculate bounding box
+```
+
+If detected → avoidance behavior triggered.
+
+---
+
+### Gate Detection
+
+Gate is a rectangular metal frame.
+
+Detection methods:
+
+Primary:
+
+```
+Canny edge detection
+↓
+Hough line transform
+↓
+Detect vertical lines
+↓
+Identify rectangular gate
+```
+
+Alternative:
+
+Detect two vertical parallel pipes.
+
+---
+
+### Green Mat Detection
+
+Method:
+
+```
+HSV threshold for green
+↓
+Large contour detection
+↓
+Area threshold filtering
+```
+
+Used to detect target zone.
+
+---
+
+### Drum Detection
+
+Objects:
+
+| Object    | Detection     |
+| --------- | ------------- |
+| Red drums | red HSV mask  |
+| Blue drum | blue HSV mask |
+
+Process:
+
+```
+HSV threshold
+↓
+Contour detection
+↓
+Area filtering
+↓
+Calculate centroid
+```
+
+Largest valid contour used as target.
+
+---
+
+# 7. Alignment Algorithm
+
+Alignment uses:
+
+**Image-Based Visual Servoing (IBVS)**
+
+Reference:
+
+```
+camera frame center = alignment target
+```
+
+If object center ≠ frame center → adjust robot orientation.
+
+---
+
+### Error Calculation
+
+```
+error_x = object_center_x - frame_center_x
+```
+
+Control output:
+
+```
+yaw_pwm = 1500 + Kp * error_x
+```
+
+Used to rotate robot.
+
+---
+
+### PID Controller
+
+Basic controller:
+
+```
+output = Kp * error + Ki * integral + Kd * derivative
+```
+
+Initial tuning suggestion:
+
+```
+Kp = 0.005
+Ki = 0
+Kd = 0.002
+```
+
+---
+
+# 8. Navigation Logic
+
+Navigation controlled through a **state machine**.
+
+States:
+
+```
+STATE 1 – ENTER_ARENA
+STATE 2 – SEARCH_GATE
+STATE 3 – PASS_GATE_FORWARD
+STATE 4 – U_TURN
+STATE 5 – PASS_GATE_REVERSE
+STATE 6 – SEARCH_GREEN_MAT
+STATE 7 – DETECT_DRUMS
+STATE 8 – ALIGN_BLUE_DRUM
+STATE 9 – DROP_BALL
+STATE 10 – GENERATE_MAP
+STATE 11 – FIND_EXIT
+STATE 12 – MISSION_COMPLETE
+```
+
+Important rule:
+
+Object detection is **state filtered**.
+
+Example:
+
+```
+green mat detection only enabled in STATE 6
+```
+
+---
+
+# 9. Obstacle Avoidance
+
+If orange flare detected:
+
+```
+if flare_x < frame_center:
+    move_right
+else:
+    move_left
+```
+
+Robot continues forward after obstacle clears.
+
+---
+
+# 10. 180° U-Turn
+
+Using IMU heading.
+
+Process:
+
+```
+target_heading = current_heading + 180°
+```
+
+Rotate until:
+
+```
+|heading_error| < 3°
+```
+
+---
+
+# 11. Ball Drop Mechanism
+
+Hardware:
+
+* servo
+* mechanical release
+
+Activation condition:
+
+```
+blue drum centered
+AND
+drum size threshold reached
+```
+
+Command:
+
+```
+activate servo release
+```
+
+---
+
+# 12. Drum Mapping
+
+System generates a simple **2D map of detected drums**.
+
+Coordinates stored as:
+
+```
+drums = {
+   red1: (x,y),
+   red2: (x,y),
+   blue: (x,y)
+}
+```
+
+Visualization:
+
+* Python plotting
+* simple 2D grid map
+
+---
+
+# 13. Control Interface (iBus)
+
+Communication protocol:
+
+```
+UART
+iBus
+```
+
+Channel mapping:
+
+| Channel | Function                   |
+| ------- | -------------------------- |
+| CH1     | roll                       |
+| CH2     | forward / pitch            |
+| CH3     | heave (vertical)           |
+| CH4     | yaw / sleay                |
+| CH5     | front thruster servo angle |
+| CH6     | rear thruster servo angle  |
+| CH7     | mode switch                |
+| CH8     | arm/disarm                 |
+| CH9     | pitch ↔ forward switch     |
+| CH10    | yaw ↔ lateral movement     |
+
+---
+
+# 14. Autonomous Control Channels
+
+Autonomous system controls:
+
+| Channel | Purpose          |
+| ------- | ---------------- |
+| CH2     | forward motion   |
+| CH3     | depth control    |
+| CH4     | yaw alignment    |
+| CH10    | lateral movement |
+
+Servo channels fixed:
+
+```
+CH5 = 1500
+CH6 = 1500
+```
+
+---
+
+# 15. Mode Switching
+
+Mode selected using CH7.
+
+| PWM  | Mode       |
+| ---- | ---------- |
+| 1000 | manual     |
+| 1500 | stabilizer |
+| 2000 | autonomous |
+
+Autonomous mode enabled only when:
+
+```
+CH7 = 2000
+AND
+CH8 = armed
+```
+
+---
+
+# 16. Safety Requirements
+
+Manual override must always be available.
+
+Safety rules:
+
+* CH8 arm switch must remain manual
+* sudden PWM jumps prohibited
+* command smoothing required
+
+Example safe transition:
+
+```
+1500 → 1520 → 1540 → 1560
+```
+
+---
+
+# 17. Software Structure
+
+Recommended project structure:
+
+```
+rov_autonomy/
+
+main.py
+state_machine.py
+vision/
+    flare_detection.py
+    gate_detection.py
+    drum_detection.py
+navigation/
+    alignment.py
+    pid_controller.py
+control/
+    ibus_interface.py
+mapping/
+    drum_map.py
+```
+
+---
+
+# 18. Main Loop Logic
+
+Example loop:
+
+```
+while mission_active:
+
+    frame = camera.capture()
+
+    detect_flare()
+    detect_gate()
+
+    if state == SEARCH_GATE:
+        align_gate()
+
+    if state == SEARCH_GREEN_MAT:
+        detect_green_mat()
+
+    if state == DETECT_DRUMS:
+        find_blue_drum()
+
+    send_ibus_commands()
+```
+
+---
+
+# 19. Performance Requirements
+
+Vision processing:
+
+```
+≥ 20 FPS
+```
+
+Navigation latency:
+
+```
+< 100 ms control loop
+```
+
+Alignment tolerance:
+
+```
+±20 pixels
+```
+
+---
+
+# 20. Known Challenges
+
+Major real-world difficulties:
+
+* underwater lighting distortion
+* water turbidity
+* robot drift
+* camera glare
+
+Control stability must be prioritized before autonomy testing.
+
+---
+
+# 21. Development Timeline Estimate
+
+| Stage            | Estimated Time |
+| ---------------- | -------------- |
+| Vision pipeline  | 2–3 days       |
+| Gate detection   | 3 days         |
+| Navigation logic | 3 days         |
+| Drum detection   | 2 days         |
+| Integration      | 2 days         |
+
+Total development:
+
+```
+~12–14 days coding
++ pool testing
+```
+
+---

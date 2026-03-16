@@ -1,0 +1,5 @@
+opencv-python>=4.9
+numpy>=1.24
+pyserial>=3.5
+matplotlib>=3.7
+picamera2>=0.3
